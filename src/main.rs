@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
 use crate::proxy::ProxyHandler;
-use crate::session::SessionHash;
+use crate::session::{CredentialKey, SessionHash};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,17 +40,19 @@ async fn main() -> Result<()> {
 
     let headers = headers::parse(&cli.headers).context("failed to parse --header arguments")?;
     let session = SessionHash::new(&cli.server_url, cli.resource.as_deref(), &headers);
+    let cred_key = CredentialKey::new(&cli.server_url, cli.resource.as_deref());
 
     tracing::info!(
         server_url = %cli.server_url,
         %session,
+        %cred_key,
         header_count = headers.len(),
         "starting hyper-mcp-remote"
     );
 
     // Run the auth dance (cached or interactive) and produce the HTTP client
     // that the streamable-http transport will drive.
-    let auth_outcome = auth::acquire_auth_client(&cli, &session, &headers)
+    let auth_outcome = auth::acquire_auth_client(&cli, &cred_key, &headers)
         .await
         .context("failed to authenticate with remote MCP server")?;
 

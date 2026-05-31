@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rmcp::transport::auth::{AuthError, CredentialStore, StoredCredentials};
 
-use crate::session::SessionHash;
+use crate::session::CredentialKey;
 
 /// Service identifier used in the OS keyring. Keep this stable across
 /// releases; bumping it will orphan all previously stored tokens.
@@ -24,36 +24,38 @@ const KEYRING_SERVICE: &str = "io.github.hyper-mcp-rs.hyper-mcp-remote";
 /// Credential store backed by the OS keyring, with an automatic file
 /// fallback when the keyring backend is unavailable.
 pub struct SecureCredentialStore {
-    /// The keyring account name. Combines a schema version and the session
-    /// hash so future migrations can be performed without trampling old
-    /// entries.
+    /// The keyring account name. Derived from a [`CredentialKey`] so it is
+    /// stable across launches as long as the user keeps pointing at the
+    /// same `(server_url, resource)`. Request-time header churn does not
+    /// invalidate this entry.
     account: String,
-    /// Path used for the file-based fallback.
+    /// Path used for the file-based fallback. Keyed off the same
+    /// `CredentialKey` so the fallback persists across launches too.
     fallback_path: PathBuf,
 }
 
 impl SecureCredentialStore {
-    /// Build a credential store keyed by `session`. The store transparently
+    /// Build a credential store keyed by `key`. The store transparently
     /// falls back to file storage if the keyring is unavailable on this
     /// platform/session.
-    pub fn new(session: &SessionHash) -> Result<Self> {
+    pub fn new(key: &CredentialKey) -> Result<Self> {
         let dirs = directories::ProjectDirs::from("io.github", "hyper-mcp-rs", "hyper-mcp-remote")
             .context("failed to resolve user config directory")?;
 
-        Self::with_data_dir(session, dirs.data_local_dir())
+        Self::with_data_dir(key, dirs.data_local_dir())
     }
 
     /// Same as [`Self::new`] but with the data directory injected, primarily
     /// for tests that need to point the file-fallback at a `tempdir`.
-    pub fn with_data_dir(session: &SessionHash, data_dir: &std::path::Path) -> Result<Self> {
+    pub fn with_data_dir(key: &CredentialKey, data_dir: &std::path::Path) -> Result<Self> {
         let dir = data_dir.join("credentials");
         std::fs::create_dir_all(&dir).with_context(|| {
             format!("failed to create credentials directory: {}", dir.display())
         })?;
 
         Ok(Self {
-            account: format!("v1:{session}"),
-            fallback_path: dir.join(format!("{session}.json")),
+            account: key.to_string(),
+            fallback_path: dir.join(format!("{key}.json")),
         })
     }
 
@@ -184,17 +186,12 @@ fn write_secret_file(path: &std::path::Path, data: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rmcp::transport::auth::{CredentialStore, StoredCredentials};
-    use std::collections::HashMap;
 
     fn make_store(dir: &std::path::Path, salt: &str) -> SecureCredentialStore {
-        // Distinct sessions per test so that even if a keyring is present
+        // Distinct keys per test so that even if a keyring is present
         // (e.g. on a developer's macOS box), each test gets its own entry.
-        let session = SessionHash::new(
-            &format!("https://example.com/{salt}"),
-            None,
-            &HashMap::new(),
-        );
-        SecureCredentialStore::with_data_dir(&session, dir).expect("with_data_dir")
+        let key = CredentialKey::new(&format!("https://example.com/{salt}"), None);
+        SecureCredentialStore::with_data_dir(&key, dir).expect("with_data_dir")
     }
 
     /// Build a `StoredCredentials` via JSON to avoid pulling in the `oauth2`
@@ -334,9 +331,9 @@ mod tests {
         // Just check that `new` doesn't crash and produces a non-empty
         // account string. Avoids touching shared user state by going
         // through `with_data_dir` for any real work.
-        let session = SessionHash::new("https://example.com/x", None, &HashMap::new());
-        let store = SecureCredentialStore::new(&session).expect("new");
-        assert!(store.account.contains(&session.to_string()));
+        let key = CredentialKey::new("https://example.com/x", None);
+        let store = SecureCredentialStore::new(&key).expect("new");
+        assert_eq!(store.account, key.to_string());
     }
 
     #[test]

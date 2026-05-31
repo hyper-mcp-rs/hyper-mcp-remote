@@ -20,7 +20,7 @@ use reqwest::Client as HttpClient;
 use rmcp::transport::auth::{AuthClient, OAuthState};
 
 use crate::cli::Cli;
-use crate::session::SessionHash;
+use crate::session::CredentialKey;
 
 use self::callback::CallbackServer;
 use self::discovery::{AuthRequirement, OAuthDiscovery};
@@ -44,12 +44,12 @@ pub enum AuthOutcome {
 /// them to complete the flow.
 pub async fn acquire_auth_client(
     cli: &Cli,
-    session: &SessionHash,
+    cred_key: &CredentialKey,
     headers: &HashMap<HeaderName, HeaderValue>,
 ) -> Result<AuthOutcome> {
     let http_client = build_http_client()?;
 
-    let store = Arc::new(SecureCredentialStore::new(session)?);
+    let store = Arc::new(SecureCredentialStore::new(cred_key)?);
     if cli.reset_auth {
         tracing::info!("--reset-auth specified; clearing any cached credentials");
         store
@@ -365,9 +365,9 @@ mod tests {
         let (url, _h) = spawn_anonymous_mock().await;
         let cli = parse_cli(&["--allow-http", &url]);
         let headers = HashMap::new();
-        let session = SessionHash::new(&url, None, &headers);
+        let cred_key = CredentialKey::new(&url, None);
 
-        let outcome = acquire_auth_client(&cli, &session, &headers)
+        let outcome = acquire_auth_client(&cli, &cred_key, &headers)
             .await
             .expect("acquire");
         assert!(
@@ -381,9 +381,9 @@ mod tests {
         // Exercise the ArcStore wrapper: even with no creds it must return
         // Ok(None) rather than erroring.
         let dir = tempfile::tempdir().expect("tempdir");
-        let session = SessionHash::new("https://example.com/arc-empty", None, &HashMap::new());
+        let cred_key = CredentialKey::new("https://example.com/arc-empty", None);
         let store =
-            SecureCredentialStore::with_data_dir(&session, dir.path()).expect("with_data_dir");
+            SecureCredentialStore::with_data_dir(&cred_key, dir.path()).expect("with_data_dir");
         let arc_store = ArcStore(Arc::new(store));
         let loaded = rmcp::transport::auth::CredentialStore::load(&arc_store)
             .await
