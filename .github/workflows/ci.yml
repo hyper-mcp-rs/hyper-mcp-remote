@@ -1,0 +1,226 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - ".github/workflows/nightly.yml"
+      - ".github/workflows/release.yml"
+      - "**/*.md"
+      - ".gitignore"
+      - "LICENSE"
+      - ".github/renovate.json5"
+      - ".dockerignore"
+      - "Dockerfile"
+      - ".zed/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 1
+
+permissions:
+  contents: read # checkout repository
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cache-prep:
+    name: Prepare Cache
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target/
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            cargo-target-${{ runner.os }}-
+
+      - name: Build all workspace artifacts and tests
+        run: |
+          cargo check --workspace --all-features --locked
+          cargo test --no-run --workspace --all-features --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    needs: cache-prep
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Restore cargo registry
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Restore target directory
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target/
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            cargo-target-${{ runner.os }}-
+
+      - name: Restore file timestamps
+        run: |
+          # Update source file timestamps to prevent unnecessary rebuilds
+          # This makes cargo think files haven't changed since the cache was created
+          git ls-files -z | xargs -0 touch
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-features --locked -- -D warnings
+
+  formatting:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    needs: cache-prep
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: cache-prep
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+
+      - name: Restore cargo registry
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Restore target directory
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target/
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            cargo-target-${{ runner.os }}-
+
+      - name: Restore file timestamps
+        run: |
+          # Update source file timestamps to prevent unnecessary rebuilds
+          # This makes cargo think files haven't changed since the cache was created
+          git ls-files -z | xargs -0 touch
+
+      - name: Install sentrux
+        run: curl -fsSL https://raw.githubusercontent.com/sentrux/sentrux/main/install.sh | sh
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run tests with coverage
+        run: RUST_BACKTRACE=1 cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx -f json --all-features --override-filename temp
+
+      - name: Clean SBOM
+        run: jq '
+          del(.metadata.component."bom-ref")
+          | del(.metadata.component.purl)
+          | del(.metadata.component.components[0]."bom-ref")
+          | del(.metadata.component.components[0].purl)
+          ' temp.json > sbom.cdx.json
+
+  # Summary job to check if all required jobs passed
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    needs: [clippy, formatting, tests, sbom]
+
+    steps:
+      - name: All jobs succeeded
+        run: echo "All CI jobs passed!"

@@ -1,0 +1,50 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+  ],
+  schedule: [
+    'on monday',
+  ],
+  packageRules: [
+    {
+      matchDepTypes: [
+        'action',
+      ],
+      pinDigests: true,
+    },
+    {
+      extends: [
+        'helpers:pinGitHubActionDigests',
+      ],
+      extractVersion: '^(?<version>v?\\d+\\.\\d+\\.\\d+)$',
+      versioning: 'regex:^v?(?<major>\\d+)(\\.(?<minor>\\d+)\\.(?<patch>\\d+))?$',
+    },
+    {
+      matchManagers: [
+        'github-actions',
+      ],
+      groupName: 'GitHub Actions',
+      labels: [
+        'dependencies',
+        'github-actions',
+      ],
+      commitMessagePrefix: 'github-actions',
+      "rangeStrategy": "pin",
+    },
+    {
+      matchManagers: [
+        'cargo',
+      ],
+      groupName: 'Rust dependencies',
+      labels: [
+        'dependencies',
+        'rust',
+      ],
+      commitMessagePrefix: 'rust',
+    },
+  ],
+  prHourlyLimit: 4,
+  prConcurrentLimit: 16,
+  dependencyDashboard: true,
+}

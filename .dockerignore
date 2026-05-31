@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+debug/
+
+# Version control
+.git/
+.github/
+.gitignore
+
+# Editor/IDE
+.cursor/
+.windsurf/
+**/*.rs.bk
+
+# Documentation
+README.md
+LICENSE
+
+# Docker
+Dockerfile
+.dockerignore
