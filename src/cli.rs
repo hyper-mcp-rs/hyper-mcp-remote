@@ -68,6 +68,20 @@ pub struct Cli {
     /// prevent accidental cleartext token transmission.
     #[arg(long)]
     pub allow_http: bool,
+
+    /// Interval, in seconds, between MCP `ping` requests sent to the remote
+    /// server to keep its session alive across idle intermediaries (load
+    /// balancers, NATs, server-side idle timeouts). Set to `0` to disable
+    /// keepalive pings.
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    pub ping_interval_secs: u64,
+
+    /// Per-ping timeout in seconds. If a `ping` doesn't complete within this
+    /// window the failure is logged but the connection is not torn down —
+    /// the underlying transport layer remains the source of truth for
+    /// liveness.
+    #[arg(long, value_name = "SECS", default_value_t = 10)]
+    pub ping_timeout_secs: u64,
 }
 
 impl Cli {
@@ -91,6 +105,12 @@ impl Cli {
 
         if url.scheme() != "http" && url.scheme() != "https" {
             anyhow::bail!("server URL must use http or https scheme");
+        }
+
+        // A zero `ping_timeout_secs` while pings are enabled would degenerate
+        // to an instant timeout on every probe, so reject it up-front.
+        if self.ping_interval_secs != 0 && self.ping_timeout_secs == 0 {
+            anyhow::bail!("--ping-timeout-secs must be > 0 when keepalive pings are enabled");
         }
 
         Ok(())
@@ -210,5 +230,33 @@ mod tests {
         assert_eq!(cli.auth_timeout_secs, 300);
         assert!(!cli.reset_auth);
         assert!(!cli.allow_http);
+        assert_eq!(cli.ping_interval_secs, 60);
+        assert_eq!(cli.ping_timeout_secs, 10);
+    }
+
+    #[test]
+    fn validate_rejects_zero_ping_timeout_when_pings_enabled() {
+        let cli = cli_with(&["--ping-timeout-secs", "0", "https://example.com/mcp"]);
+        let err = cli
+            .validate()
+            .expect_err("zero ping timeout with enabled pings must be rejected");
+        assert!(
+            err.to_string().contains("--ping-timeout-secs"),
+            "error must mention the offending flag; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_zero_ping_timeout_when_pings_disabled() {
+        // With keepalive turned off entirely the timeout value is irrelevant.
+        let cli = cli_with(&[
+            "--ping-interval-secs",
+            "0",
+            "--ping-timeout-secs",
+            "0",
+            "https://example.com/mcp",
+        ]);
+        cli.validate()
+            .expect("disabled pings should bypass the timeout check");
     }
 }

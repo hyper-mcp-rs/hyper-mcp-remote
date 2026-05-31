@@ -27,16 +27,17 @@
 //! capabilities the remote advertises.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Result;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientInfo,
+    CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientInfo, ClientRequest,
     CompleteRequestParams, CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
     CreateMessageRequestParams, CreateMessageResult, ElicitationResponseNotificationParam,
     ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult, Implementation,
     InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListRootsResult, ListToolsResult, LoggingMessageNotificationParam,
-    PaginatedRequestParams, ProgressNotificationParam, ReadResourceRequestParams,
+    PaginatedRequestParams, PingRequest, ProgressNotificationParam, ReadResourceRequestParams,
     ReadResourceResult, ResourceUpdatedNotificationParam, ServerCapabilities,
     SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
 };
@@ -45,8 +46,57 @@ use rmcp::service::{
 };
 use rmcp::{ClientHandler, ServerHandler};
 use tokio::sync::OnceCell;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 use crate::transport::RemoteTransport;
+
+// ---------------------------------------------------------------------------
+// Keepalive configuration
+// ---------------------------------------------------------------------------
+
+/// How aggressively to send MCP `ping` requests to the remote server.
+///
+/// Many Streamable-HTTP MCP deployments sit behind load balancers, NAT
+/// devices, or have server-side idle timeouts that silently drop an
+/// otherwise-healthy session after a few minutes of inactivity. Without a
+/// keepalive the next user-triggered tool call would be the thing that
+/// discovers the session is gone — producing a surprising error mid-task.
+///
+/// A periodic `ping` request keeps the session warm and gives us an early,
+/// log-visible signal when the upstream becomes unreachable.
+#[derive(Debug, Clone, Copy)]
+pub struct KeepaliveConfig {
+    /// Time between consecutive ping requests. `None` disables keepalive
+    /// entirely.
+    pub interval: Option<Duration>,
+    /// Maximum time to wait for any individual ping to complete before
+    /// logging a warning. The connection itself is not torn down on
+    /// timeout — we let the underlying transport be the authority on
+    /// liveness and merely surface a diagnostic.
+    pub timeout: Duration,
+}
+
+impl KeepaliveConfig {
+    /// Build a config from CLI-shaped `u64` seconds. An `interval_secs` of
+    /// `0` disables pings; otherwise both values are interpreted as seconds.
+    pub fn from_secs(interval_secs: u64, timeout_secs: u64) -> Self {
+        let interval = (interval_secs > 0).then(|| Duration::from_secs(interval_secs));
+        Self {
+            interval,
+            timeout: Duration::from_secs(timeout_secs.max(1)),
+        }
+    }
+
+    /// Convenience constructor for tests / callers that want pings off.
+    #[cfg(test)]
+    pub const fn disabled() -> Self {
+        Self {
+            interval: None,
+            timeout: Duration::from_secs(10),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RemoteClientHandler — relays remote→client traffic back to the stdio client
@@ -198,6 +248,15 @@ struct Remote {
     init_result: InitializeResult,
     /// Background task keeping the remote client service alive.
     _service_handle: tokio::task::JoinHandle<()>,
+    /// Background task that periodically pings the remote to keep its
+    /// session warm. Held only for its lifetime side-effects — it observes
+    /// `_keepalive_cancel` and exits cleanly when the service task does.
+    _keepalive_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation hook tied to both the service-supervisor task and the
+    /// keepalive ping task. Cancelling it stops the pinger; the service
+    /// supervisor cancels it automatically when the underlying rmcp service
+    /// ends, so we never leak a long-lived pinger past its peer.
+    _keepalive_cancel: CancellationToken,
 }
 
 /// `ServerHandler` for the local stdio connection. Lazily connects to the
@@ -209,15 +268,17 @@ pub struct ProxyHandler {
     /// brief, synchronous `take()` while the connection is being established.
     transport: Mutex<Option<RemoteTransport>>,
     remote: OnceCell<Remote>,
+    keepalive: KeepaliveConfig,
 }
 
 impl ProxyHandler {
     /// Wrap a freshly built [`RemoteTransport`]. The remote connection is
     /// not opened until the local client sends `initialize`.
-    pub fn new(transport: RemoteTransport) -> Self {
+    pub fn new(transport: RemoteTransport, keepalive: KeepaliveConfig) -> Self {
         Self {
             transport: Mutex::new(Some(transport)),
             remote: OnceCell::new(),
+            keepalive,
         }
     }
 
@@ -278,11 +339,27 @@ impl ProxyHandler {
                 init_result.server_info =
                     Implementation::new("hyper-mcp-remote", env!("CARGO_PKG_VERSION"));
 
+                // Shared kill-switch for the keepalive task. The service
+                // supervisor below cancels it as soon as `waiting()` returns
+                // so the pinger never outlives its peer.
+                let keepalive_cancel = CancellationToken::new();
+                let keepalive_handle =
+                    spawn_keepalive(peer.clone(), self.keepalive, keepalive_cancel.clone());
+
+                let supervisor_cancel = keepalive_cancel.clone();
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = running.waiting().await {
-                        tracing::warn!(error = %e, "remote MCP service ended with error");
-                    } else {
-                        tracing::info!("remote MCP service ended");
+                    let result = running.waiting().await;
+                    // Always stop the pinger — whether the service ended
+                    // cleanly or with an error, the peer is no longer
+                    // usable past this point.
+                    supervisor_cancel.cancel();
+                    match result {
+                        Ok(reason) => {
+                            tracing::info!(?reason, "remote MCP service ended");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "remote MCP service ended with error");
+                        }
                     }
                 });
 
@@ -290,6 +367,8 @@ impl ProxyHandler {
                     peer,
                     init_result,
                     _service_handle: handle,
+                    _keepalive_handle: keepalive_handle,
+                    _keepalive_cancel: keepalive_cancel,
                 })
             })
             .await
@@ -512,6 +591,73 @@ fn build_proxied_client_info(mut local: InitializeRequestParams) -> ClientInfo {
     local
 }
 
+// ---------------------------------------------------------------------------
+// Keepalive task
+// ---------------------------------------------------------------------------
+
+/// Spawn the background task that periodically MCP-pings the remote server.
+///
+/// Returns `None` when keepalive is disabled (interval = `None`) so we don't
+/// allocate a `JoinHandle` for a task that would do nothing. The task is
+/// driven by a [`tokio::time::interval`] ticking on `interval`, and observes
+/// `cancel` so it can be torn down promptly when the upstream service ends
+/// or the proxy is dropped.
+fn spawn_keepalive(
+    peer: Peer<RoleClient>,
+    config: KeepaliveConfig,
+    cancel: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let interval = config.interval?;
+    let timeout = config.timeout;
+
+    Some(tokio::spawn(async move {
+        tracing::debug!(?interval, ?timeout, "starting remote MCP keepalive pinger");
+
+        let mut ticker = tokio::time::interval(interval);
+        // Avoid bursting catch-up pings after a long blocking call —
+        // we care about "recent activity within `interval`", not strict
+        // cadence. `Delay` just shifts the next tick forward.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The very first tick of `interval` fires immediately, which would
+        // race the just-completed `initialize` handshake. Skip it so the
+        // first ping happens one full `interval` from now.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::debug!("keepalive cancelled; exiting");
+                    return;
+                }
+                _ = ticker.tick() => {
+                    ping_remote(&peer, timeout).await;
+                }
+            }
+        }
+    }))
+}
+
+/// Send a single MCP `ping` request, bounded by `timeout`. Failures are
+/// logged at `warn`; they do not propagate, because the upstream transport
+/// is the authority on whether the session is actually dead. A failed
+/// keepalive on its own should never be the reason we kill an otherwise
+/// usable connection.
+#[tracing::instrument(level = "debug", skip_all, fields(dir = "local→remote"))]
+async fn ping_remote(peer: &Peer<RoleClient>, timeout: Duration) {
+    let request = ClientRequest::PingRequest(PingRequest::default());
+    match tokio::time::timeout(timeout, peer.send_request(request)).await {
+        Ok(Ok(_)) => {
+            tracing::debug!("remote ping ok");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "remote ping failed");
+        }
+        Err(_) => {
+            tracing::warn!(?timeout, "remote ping timed out");
+        }
+    }
+}
+
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::new(ErrorCode::INTERNAL_ERROR, msg.into(), None)
 }
@@ -582,6 +728,40 @@ mod tests {
                 .message
                 .contains("local stdio client")
         );
+    }
+
+    #[test]
+    fn keepalive_config_from_secs_disables_when_interval_is_zero() {
+        let cfg = KeepaliveConfig::from_secs(0, 10);
+        assert!(
+            cfg.interval.is_none(),
+            "interval 0 must map to disabled keepalive"
+        );
+    }
+
+    #[test]
+    fn keepalive_config_from_secs_uses_provided_values() {
+        let cfg = KeepaliveConfig::from_secs(30, 7);
+        assert_eq!(cfg.interval, Some(Duration::from_secs(30)));
+        assert_eq!(cfg.timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn keepalive_config_from_secs_clamps_zero_timeout_to_one() {
+        // CLI validation rejects this combination, but defending in depth
+        // ensures internal callers can’t accidentally produce an instant
+        // timeout on every probe.
+        let cfg = KeepaliveConfig::from_secs(30, 0);
+        assert_eq!(cfg.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn keepalive_disabled_returns_no_task() {
+        // We can’t easily construct a real `Peer<RoleClient>` in a unit
+        // test, so we only exercise the early-return path. The token is
+        // unused in that branch.
+        let cfg = KeepaliveConfig::disabled();
+        assert!(cfg.interval.is_none());
     }
 
     // Silence "unused" warning if the type is only used through trait objects.

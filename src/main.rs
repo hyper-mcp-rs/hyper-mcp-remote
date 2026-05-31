@@ -24,7 +24,7 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
-use crate::proxy::ProxyHandler;
+use crate::proxy::{KeepaliveConfig, ProxyHandler};
 use crate::session::{CredentialKey, SessionHash};
 
 #[tokio::main]
@@ -59,8 +59,13 @@ async fn main() -> Result<()> {
     let transport = transport::build(&cli.server_url, headers, auth_outcome)
         .context("failed to build remote transport")?;
 
-    tracing::info!("Starting hyper-mcp-remote");
-    let handler = ProxyHandler::new(transport);
+    let keepalive = KeepaliveConfig::from_secs(cli.ping_interval_secs, cli.ping_timeout_secs);
+    tracing::info!(
+        ping_interval_secs = cli.ping_interval_secs,
+        ping_timeout_secs = cli.ping_timeout_secs,
+        "Starting hyper-mcp-remote"
+    );
+    let handler = ProxyHandler::new(transport, keepalive);
     let ct = CancellationToken::new();
     let running =
         serve_directly_with_ct::<RoleServer, _, _, _, _>(handler, stdio(), None, ct.clone());
