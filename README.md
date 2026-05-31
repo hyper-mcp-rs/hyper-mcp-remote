@@ -61,6 +61,9 @@ store. Subsequent launches start with **no user interaction**.
   `HYPER_MCP_REMOTE_LOG_PATH`.
 - 🚦 **Refuses cleartext** — non-loopback `http://` URLs are rejected unless
   you explicitly pass `--allow-http`.
+- 💓 **Keepalive pings** — periodic MCP `ping` requests keep the remote
+  session warm across idle load-balancers, NATs, and server-side timeouts,
+  with an early log-visible signal when the upstream becomes unreachable.
 
 ## Installation
 
@@ -155,6 +158,8 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | `--auth-timeout-secs <SECS>`      | Max time to wait for the user to complete the browser flow. Default: `300`.                                                                          |
 | `--reset-auth`                    | Forget any cached tokens for this server and force a fresh OAuth flow.                                                                               |
 | `--allow-http`                    | Allow non-loopback `http://` server URLs (cleartext). Disabled by default.                                                                           |
+| `--ping-interval-secs <SECS>`     | Interval between MCP `ping` requests sent to the remote to keep its session alive. Set to `0` to disable. Default: `30`.                             |
+| `--ping-timeout-secs <SECS>`      | Per-ping timeout. A timed-out ping is logged but does not tear the session down — the transport remains the authority on liveness. Default: `10`.    |
 | `-h`, `--help`                    | Print help.                                                                                                                                          |
 | `-V`, `--version`                 | Print version.                                                                                                                                       |
 
@@ -190,6 +195,44 @@ Unknown env vars expand to an empty string and are logged as a warning.
 If the server accepts unauthenticated requests, the proxy detects that on
 the first probe and skips OAuth entirely. There's nothing extra to
 configure.
+
+### Keeping the session alive
+
+Many hosted MCP deployments sit behind load balancers, NAT devices, or
+have server-side idle timeouts that silently drop an otherwise-healthy
+session after a few minutes of inactivity. Without a keepalive, the next
+tool call your client makes would be the thing that discovers the session
+is gone — surfacing a confusing error mid-task.
+
+The proxy sends an MCP `ping` request every `--ping-interval-secs` (default
+`30`) to keep the upstream session warm. Each ping is bounded by
+`--ping-timeout-secs` (default `10`); timeouts and failures are logged at
+`warn` but the session is **not** torn down on a single failed ping — the
+underlying transport remains the authority on whether the connection is
+actually dead.
+
+Tune or disable as needed:
+
+```jsonc
+{
+  "mcpServers": {
+    "chatty": {
+      "command": "hyper-mcp-remote",
+      "args": [
+        "https://example.com/mcp",
+        "--ping-interval-secs", "60"   // every 60s instead of 30s
+      ]
+    },
+    "already-keepalived": {
+      "command": "hyper-mcp-remote",
+      "args": [
+        "https://example.com/mcp",
+        "--ping-interval-secs", "0"    // disable; the server is fine on its own
+      ]
+    }
+  }
+}
+```
 
 ## Where things live
 
