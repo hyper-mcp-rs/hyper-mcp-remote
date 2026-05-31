@@ -176,7 +176,10 @@ jobs:
           git ls-files -z | xargs -0 touch
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        # Built from crates.io against Cargo.lock to keep the trust surface to
+        # the Rust toolchain + crates.io (no extra GitHub Action). Renovate bumps
+        # the version constraint in PRs.
+        run: cargo install cargo-llvm-cov --locked --version ^0.8
 
       - name: Run tests with coverage
         run: RUST_BACKTRACE=1 cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
