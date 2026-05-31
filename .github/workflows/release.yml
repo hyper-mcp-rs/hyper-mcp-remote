@@ -485,7 +485,7 @@ jobs:
             end
 
             test do
-              assert_match "hyper-mcp-remote", shell_output("#{bin}/hyper-mcp-remote --version")
+              assert_match version.to_s, shell_output("#{bin}/hyper-mcp-remote --version")
             end
           end
           EOF
