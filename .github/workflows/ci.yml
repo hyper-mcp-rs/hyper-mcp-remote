@@ -13,6 +13,7 @@ on:
       - ".dockerignore"
       - "Dockerfile"
       - ".zed/**"
+      - "lefthook.yml"
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -173,9 +174,6 @@ jobs:
           # Update source file timestamps to prevent unnecessary rebuilds
           # This makes cargo think files haven't changed since the cache was created
           git ls-files -z | xargs -0 touch
-
-      - name: Install sentrux
-        run: curl -fsSL https://raw.githubusercontent.com/sentrux/sentrux/main/install.sh | sh
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
