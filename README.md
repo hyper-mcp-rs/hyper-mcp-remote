@@ -1,0 +1,313 @@
+# hyper-mcp-remote
+
+[![CI](https://github.com/hyper-mcp-rs/hyper-mcp-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/hyper-mcp-rs/hyper-mcp-remote/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/hyper-mcp-remote.svg)](https://crates.io/crates/hyper-mcp-remote)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+A small, fast **stdio → Streamable-HTTP MCP proxy with OAuth 2.1**, written in
+Rust.
+
+`hyper-mcp-remote` lets any local [Model Context Protocol](https://modelcontextprotocol.io)
+client that only speaks **stdio** — Claude Desktop, Cursor, Zed, Continue,
+Windsurf, … — connect to a **remote** MCP server that speaks
+[Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)
+and requires OAuth.
+
+It is a drop-in Rust alternative to the
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) npm package — no
+Node.js runtime, single static binary, OS-native secret storage.
+
+---
+
+## Why?
+
+The MCP specification defines two transports:
+
+- **stdio** — what almost every desktop client implements.
+- **Streamable HTTP** — what hosted/remote servers (GitLab, Linear, Atlassian,
+  Cloudflare, GitHub, …) use, often gated by OAuth 2.1.
+
+If your client only speaks stdio, you need a bridge. `hyper-mcp-remote` is
+that bridge:
+
+```text
+┌────────────────┐  stdio  ┌─────────────────┐   HTTPS + OAuth  ┌────────────────┐
+│  MCP client    │ ──────▶ │ hyper-mcp-remote │ ───────────────▶ │ remote MCP svr │
+│ (Claude/Zed/…) │ ◀────── │   (this crate)   │ ◀─────────────── │ (GitLab/etc.)  │
+└────────────────┘         └─────────────────┘                  └────────────────┘
+```
+
+On first run it performs the full MCP OAuth dance
+(RFC 9728 discovery → RFC 8414 metadata → dynamic client registration →
+OAuth 2.1 authorize + PKCE → token exchange), pops the user's browser open
+for consent, and stores the resulting refresh token in the OS-native secret
+store. Subsequent launches start with **no user interaction**.
+
+## Features
+
+- 🦀 **Single static binary** — no Node, no Python, no runtime to manage.
+- 🔐 **Full MCP OAuth 2.1** — discovery (RFC 9728 / RFC 8414), dynamic client
+  registration (RFC 7591), PKCE, refresh, RFC 8707 resource binding.
+- 🗝️ **OS-native credential storage** — macOS Keychain, Windows Credential
+  Manager, freedesktop Secret Service. Falls back to a `0600` JSON file when
+  no keyring backend is available (headless Linux, CI).
+- 🔁 **Bidirectional proxy** — forwards sampling, elicitation, `list_roots`,
+  log notifications, progress, cancellation, and resource update streams in
+  both directions.
+- 🧩 **Custom headers with `${ENV}` interpolation** — pass API keys or extra
+  tenant routing headers from your MCP client config.
+- 🪵 **Safe logging** — writes to a daily-rolling file (stderr is unusable on a
+  stdio transport); install location is overridable via
+  `HYPER_MCP_REMOTE_LOG_PATH`.
+- 🚦 **Refuses cleartext** — non-loopback `http://` URLs are rejected unless
+  you explicitly pass `--allow-http`.
+
+## Installation
+
+### From crates.io
+
+```sh
+cargo install hyper-mcp-remote --locked
+```
+
+### From source
+
+```sh
+git clone https://github.com/hyper-mcp-rs/hyper-mcp-remote
+cd hyper-mcp-remote
+cargo install --path . --locked
+```
+
+### Docker
+
+```sh
+docker pull ghcr.io/hyper-mcp-rs/hyper-mcp-remote:latest
+```
+
+The image's entrypoint is the binary itself, so usage is identical:
+
+```sh
+docker run --rm -i ghcr.io/hyper-mcp-rs/hyper-mcp-remote:latest https://example.com/mcp
+```
+
+## Quick start
+
+### Claude Desktop / Cursor / Windsurf
+
+Add an entry to your MCP client's server config. The shape is the same
+everywhere; this is the Claude Desktop variant
+(`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```jsonc
+{
+  "mcpServers": {
+    "gitlab": {
+      "command": "hyper-mcp-remote",
+      "args": ["https://gitlab.com/api/v4/mcp"]
+    }
+  }
+}
+```
+
+### Zed
+
+In your Zed `settings.json`:
+
+```jsonc
+{
+  "context_servers": {
+    "gitlab": {
+      "command": {
+        "path": "hyper-mcp-remote",
+        "args": ["https://gitlab.com/api/v4/mcp"]
+      }
+    }
+  }
+}
+```
+
+The first time Zed (or any client) launches the proxy, your browser will
+open to complete the OAuth consent flow. After that, tokens are cached and
+launches are silent.
+
+## Usage
+
+```text
+hyper-mcp-remote [OPTIONS] <SERVER_URL>
+```
+
+### Arguments
+
+| Argument       | Description                                                   |
+| -------------- | ------------------------------------------------------------- |
+| `<SERVER_URL>` | URL of the remote MCP server, e.g. `https://example.com/mcp`. |
+
+### Options
+
+| Flag                              | Description                                                                                                                                          |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--header <HEADER>`               | Extra HTTP header to send on every request. Format `Name: value`. Supports `${ENV}` interpolation. Repeatable.                                       |
+| `--resource <URL>`                | OAuth resource identifier (RFC 8707). Use to isolate sessions when proxying multiple tenants of the same server.                                     |
+| `--client-name <NAME>`            | OAuth client name advertised during dynamic client registration. Default: `hyper-mcp-remote`.                                                        |
+| `--scope <SCOPES>`                | Comma-separated OAuth scopes, overriding any scopes discovered from server metadata.                                                                 |
+| `--callback-host <HOST>`          | Bind address for the local OAuth callback server (loopback only). Default: `127.0.0.1`.                                                              |
+| `--callback-port <PORT>`          | Fixed port for the local OAuth callback server. Defaults to an OS-selected ephemeral port. Set this when the auth server requires a fixed redirect URI. |
+| `--auth-timeout-secs <SECS>`      | Max time to wait for the user to complete the browser flow. Default: `300`.                                                                          |
+| `--reset-auth`                    | Forget any cached tokens for this server and force a fresh OAuth flow.                                                                               |
+| `--allow-http`                    | Allow non-loopback `http://` server URLs (cleartext). Disabled by default.                                                                           |
+| `-h`, `--help`                    | Print help.                                                                                                                                          |
+| `-V`, `--version`                 | Print version.                                                                                                                                       |
+
+### Passing secrets via headers
+
+Values inside `--header` may contain `${VAR}` placeholders that are
+interpolated from the process environment at startup. This lets you keep
+secrets in your MCP client's `env:` block instead of embedding them in args:
+
+```jsonc
+{
+  "mcpServers": {
+    "internal": {
+      "command": "hyper-mcp-remote",
+      "args": [
+        "https://internal.example.com/mcp",
+        "--header", "Authorization: Bearer ${INTERNAL_API_TOKEN}",
+        "--header", "X-Tenant: ${TENANT_ID}"
+      ],
+      "env": {
+        "INTERNAL_API_TOKEN": "…",
+        "TENANT_ID": "acme"
+      }
+    }
+  }
+}
+```
+
+Unknown env vars expand to an empty string and are logged as a warning.
+
+### Anonymous (no-OAuth) servers
+
+If the server accepts unauthenticated requests, the proxy detects that on
+the first probe and skips OAuth entirely. There's nothing extra to
+configure.
+
+## Where things live
+
+| Item                | Location                                                                                                                                                                                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cached OAuth tokens | OS keyring under service `io.github.hyper-mcp-rs.hyper-mcp-remote`. Fallback file: `<data_local_dir>/hyper-mcp-remote/credentials/<hash>.json` (mode `0600`).                                                              |
+| Rolling log files   | `<config_dir>/hyper-mcp-remote/logs/mcp-server.log` (daily rotation). Override with `HYPER_MCP_REMOTE_LOG_PATH=/some/dir`. Verbosity controlled by `RUST_LOG` (e.g. `RUST_LOG=hyper_mcp_remote=debug`).                    |
+
+`<config_dir>` and `<data_local_dir>` follow the OS conventions used by the
+[`directories`](https://docs.rs/directories) crate (XDG on Linux, Application
+Support on macOS, `%APPDATA%` on Windows).
+
+## Troubleshooting
+
+**The browser didn't open.**
+Some headless or remote contexts (SSH sessions, Docker, locked-down desktops)
+can't spawn a browser. The authorization URL is also printed to the rolling
+log file — open it manually on a machine with a browser, log in, and let the
+proxy receive the callback. Use `--callback-host` / `--callback-port` if you
+need to tunnel the redirect.
+
+**OAuth keeps re-prompting.**
+Run with `--reset-auth` once to clear stale tokens, then try again. If you
+proxy multiple tenants of the same server, give each its own `--resource`
+value so their tokens don't collide.
+
+**The server uses self-signed certificates.**
+Not currently supported — `reqwest` is built with rustls and the system
+trust store. Open an issue if you need a flag for this.
+
+**Where are my logs?**
+See *Where things live* above. The proxy never logs to stderr because that
+would corrupt the stdio MCP framing.
+
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client (stdio)
+    participant P as hyper-mcp-remote
+    participant B as Browser
+    participant A as Authorization server
+    participant S as Remote MCP server
+
+    C->>P: spawn (stdio)
+    P->>S: probe (no auth)
+    S-->>P: 401 + WWW-Authenticate
+    P->>S: GET .well-known/oauth-protected-resource
+    S-->>P: PRM metadata (RFC 9728)
+    P->>A: GET .well-known/oauth-authorization-server
+    A-->>P: AS metadata (RFC 8414)
+    P->>A: dynamic client registration (RFC 7591)
+    P->>B: open authorize URL (PKCE)
+    B->>A: user consents
+    A-->>P: code (loopback redirect)
+    P->>A: token exchange
+    A-->>P: access + refresh tokens
+    P->>P: persist to OS keyring
+    C->>P: initialize / tools/list / …
+    P->>S: same, with Bearer token
+    S-->>P: responses + server-initiated requests
+    P-->>C: forwarded
+```
+
+On every later launch, the keyring lookup short-circuits everything from
+"probe" through "token exchange".
+
+## Building & testing
+
+```sh
+cargo build --release
+cargo test                            # unit + offline integration tests
+cargo test --test e2e_gitlab -- --ignored --nocapture   # live OAuth against gitlab.com
+```
+
+The e2e test spawns the compiled binary and drives it through a child-process
+MCP client, exactly the way Claude Desktop or Zed do. It is `#[ignore]`d
+because it requires network access and (on first run) human interaction in a
+browser.
+
+## Project layout
+
+```text
+src/
+├── main.rs        # binary entrypoint, signal handling, wiring
+├── cli.rs         # clap argument definitions and validation
+├── headers.rs     # --header parsing + ${ENV} interpolation
+├── logging.rs     # rolling-file tracing setup (installed via #[ctor])
+├── proxy.rs       # bidirectional stdio ⇄ HTTP MCP forwarder
+├── session.rs     # session/credential keying
+├── transport.rs   # Streamable-HTTP transport construction
+└── auth/
+    ├── mod.rs        # OAuth state-machine orchestration
+    ├── discovery.rs  # RFC 9728 + RFC 8414 discovery
+    ├── callback.rs   # loopback callback HTTP server
+    └── storage.rs    # OS keyring + file fallback credential store
+```
+
+## Contributing
+
+Issues and PRs welcome. Before sending a patch:
+
+```sh
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+Pre-commit hooks are wired through [`lefthook`](https://github.com/evilmartians/lefthook);
+run `lefthook install` once after cloning.
+
+## License
+
+Apache-2.0. See [`LICENSE`](LICENSE).
+
+## Acknowledgements
+
+- [`mcp-remote`](https://github.com/geelen/mcp-remote) by Glen Maddern — the
+  original Node implementation this project is functionally compatible with.
+- [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) — the Rust MCP
+  SDK that powers the transport and OAuth machinery.
