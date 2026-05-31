@@ -158,7 +158,7 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | `--auth-timeout-secs <SECS>`      | Max time to wait for the user to complete the browser flow. Default: `300`.                                                                          |
 | `--reset-auth`                    | Forget any cached tokens for this server and force a fresh OAuth flow.                                                                               |
 | `--allow-http`                    | Allow non-loopback `http://` server URLs (cleartext). Disabled by default.                                                                           |
-| `--ping-interval-secs <SECS>`     | Interval between MCP `ping` requests sent to the remote to keep its session alive. Set to `0` to disable. Default: `30`.                             |
+| `--ping-interval-secs <SECS>`     | Interval between MCP `ping` requests sent to the remote to keep its session alive. Set to `0` to disable. Default: `60`.                             |
 | `--ping-timeout-secs <SECS>`      | Per-ping timeout. A timed-out ping is logged but does not tear the session down — the transport remains the authority on liveness. Default: `10`.    |
 | `-h`, `--help`                    | Print help.                                                                                                                                          |
 | `-V`, `--version`                 | Print version.                                                                                                                                       |
