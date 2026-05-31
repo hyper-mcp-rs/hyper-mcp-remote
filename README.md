@@ -67,6 +67,33 @@ store. Subsequent launches start with **no user interaction**.
 
 ## Installation
 
+### From Homebrew
+
+```sh
+brew tap hyper-mcp-rs/tap
+brew install hyper-mcp-remote
+```
+
+The tap ships prebuilt binaries for macOS (Apple Silicon) and Linux
+(`aarch64` and `x86_64`).
+
+### From GitHub Releases
+
+Every tagged release publishes prebuilt, checksummed binaries on the
+[releases page](https://github.com/hyper-mcp-rs/hyper-mcp-remote/releases).
+The following targets are available:
+
+| Platform                | Asset                                                |
+| ----------------------- | ---------------------------------------------------- |
+| macOS (Apple Silicon)   | `hyper-mcp-remote-aarch64-apple-darwin.tar.gz`       |
+| Linux (`aarch64`)       | `hyper-mcp-remote-aarch64-unknown-linux-gnu.tar.gz`  |
+| Linux (`x86_64`)        | `hyper-mcp-remote-x86_64-unknown-linux-gnu.tar.gz`   |
+| Windows (`x86_64`)      | `hyper-mcp-remote-x86_64-pc-windows-msvc.zip`        |
+
+Each tarball/zip contains a single static `hyper-mcp-remote` binary; drop it
+anywhere on your `PATH`. A matching `checksums-<target>.txt` (SHA-256) and a
+CycloneDX `sbom.cdx.json` are uploaded alongside each release.
+
 ### From crates.io
 
 ```sh
