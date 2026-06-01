@@ -69,6 +69,17 @@ pub struct Cli {
     #[arg(long)]
     pub allow_http: bool,
 
+    /// Skip OAuth discovery and authentication entirely; talk to the remote
+    /// server anonymously (or with whatever `--header` values you supply).
+    ///
+    /// Use this for MCP servers that either accept unauthenticated traffic
+    /// but signal their session state with a non-spec-compliant `401` (e.g.
+    /// stateful Streamable-HTTP servers gated on `Mcp-Session-Id`), or that
+    /// use a static credential passed via `--header Authorization: ...`.
+    /// When set, no probe, no PRM lookup, and no OAuth flow are performed.
+    #[arg(long)]
+    pub no_auth: bool,
+
     /// Interval, in seconds, between MCP `ping` requests sent to the remote
     /// server to keep its session alive across idle intermediaries (load
     /// balancers, NATs, server-side idle timeouts). Set to `0` to disable
@@ -230,8 +241,17 @@ mod tests {
         assert_eq!(cli.auth_timeout_secs, 300);
         assert!(!cli.reset_auth);
         assert!(!cli.allow_http);
+        assert!(!cli.no_auth);
         assert_eq!(cli.ping_interval_secs, 60);
         assert_eq!(cli.ping_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_no_auth_flag() {
+        let cli = cli_with(&["--no-auth", "https://example.com/mcp"]);
+        assert!(cli.no_auth, "--no-auth must set the flag");
+        cli.validate()
+            .expect("--no-auth must compose with normal validation");
     }
 
     #[test]

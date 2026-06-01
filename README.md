@@ -185,6 +185,7 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | `--auth-timeout-secs <SECS>`      | Max time to wait for the user to complete the browser flow. Default: `300`.                                                                          |
 | `--reset-auth`                    | Forget any cached tokens for this server and force a fresh OAuth flow.                                                                               |
 | `--allow-http`                    | Allow non-loopback `http://` server URLs (cleartext). Disabled by default.                                                                           |
+| `--no-auth`                       | Skip OAuth discovery entirely; talk to the server anonymously (or with whatever `--header` values you supply). For non-spec-compliant servers — see *Anonymous (no-OAuth) servers* below. |
 | `--ping-interval-secs <SECS>`     | Interval between MCP `ping` requests sent to the remote to keep its session alive. Set to `0` to disable. Default: `60`.                             |
 | `--ping-timeout-secs <SECS>`      | Per-ping timeout. A timed-out ping is logged but does not tear the session down — the transport remains the authority on liveness. Default: `10`.    |
 | `-h`, `--help`                    | Print help.                                                                                                                                          |
@@ -222,6 +223,35 @@ Unknown env vars expand to an empty string and are logged as a warning.
 If the server accepts unauthenticated requests, the proxy detects that on
 the first probe and skips OAuth entirely. There's nothing extra to
 configure.
+
+Some servers are *almost* unauthenticated but signal session state with a
+non-spec-compliant `401` (e.g. a stateful Streamable-HTTP server that 401s
+when the `Mcp-Session-Id` header is missing, instead of the conventional
+`400`). The proxy can't tell that apart from "OAuth required" via the
+response alone — so it stops with a clear error pointing here. In that case,
+pass `--no-auth` to skip discovery entirely:
+
+```jsonc
+{
+  "mcpServers": {
+    "quirky": {
+      "command": "hyper-mcp-remote",
+      "args": ["http://localhost:27495/mcp", "--no-auth"]
+    }
+  }
+}
+```
+
+`--no-auth` composes with `--header`, so if the server actually wants a
+static bearer token, supply it the same way:
+
+```jsonc
+"args": [
+  "https://internal.example.com/mcp",
+  "--no-auth",
+  "--header", "Authorization: Bearer ${INTERNAL_API_TOKEN}"
+]
+```
 
 ### Keeping the session alive
 

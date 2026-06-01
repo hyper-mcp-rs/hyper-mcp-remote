@@ -49,6 +49,16 @@ pub async fn acquire_auth_client(
 ) -> Result<AuthOutcome> {
     let http_client = build_http_client()?;
 
+    // 0. Explicit opt-out: skip discovery and OAuth entirely. Useful for
+    //    servers that 401 in non-spec-compliant ways (stateful session
+    //    headers, static bearer tokens supplied via --header, ...).
+    if cli.no_auth {
+        tracing::info!(
+            "--no-auth specified; skipping OAuth discovery and using an anonymous HTTP client"
+        );
+        return Ok(AuthOutcome::Anonymous { http_client });
+    }
+
     let store = Arc::new(SecureCredentialStore::new(cred_key)?);
     if cli.reset_auth {
         tracing::info!("--reset-auth specified; clearing any cached credentials");
@@ -373,6 +383,25 @@ mod tests {
         assert!(
             matches!(outcome, AuthOutcome::Anonymous { .. }),
             "server returned 200 — we should not have started an OAuth flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_auth_client_short_circuits_on_no_auth_without_touching_network() {
+        // Point at a URL with no listener at all: if we accidentally do any
+        // probing, the test fails with a connection error. With --no-auth we
+        // must hand back AuthOutcome::Anonymous immediately.
+        let url = "http://127.0.0.1:1/mcp"; // port 1 is reserved/unbound
+        let cli = parse_cli(&["--no-auth", "--allow-http", url]);
+        let headers = HashMap::new();
+        let cred_key = CredentialKey::new(url, None);
+
+        let outcome = acquire_auth_client(&cli, &cred_key, &headers)
+            .await
+            .expect("--no-auth must not perform any network I/O");
+        assert!(
+            matches!(outcome, AuthOutcome::Anonymous { .. }),
+            "--no-auth must yield AuthOutcome::Anonymous"
         );
     }
 

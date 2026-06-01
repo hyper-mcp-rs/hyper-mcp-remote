@@ -116,10 +116,13 @@ pub async fn discover(
         );
     }
 
-    let www_auth = resp
+    let www_auth_raw = resp
         .headers()
         .get(http::header::WWW_AUTHENTICATE)
         .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let www_auth = www_auth_raw
+        .as_deref()
         .map(parse_www_authenticate)
         .unwrap_or_default();
 
@@ -161,12 +164,40 @@ pub async fn discover(
         scopes.extend(meta.scopes_supported.iter().cloned());
     }
 
-    // Pick the first authorization server, or fall back to the resource URL
-    // (some servers double as their own AS).
-    let authorization_server = prm
+    // Pick the first authorization server advertised by the PRM document.
+    // We deliberately do NOT fall back to `server_url` here: the MCP
+    // authorization spec (and RFC 6750) require a server gating access on
+    // OAuth to advertise its authorization server, either via
+    // `WWW-Authenticate: Bearer resource_metadata="..."` or via a
+    // well-known PRM document. If we received a bare `401` with neither,
+    // we have no idea where to authenticate, and silently treating the
+    // resource URL as its own authorization server typically just sends us
+    // chasing OAuth metadata against a server that doesn't speak OAuth at
+    // all (common symptom: a stateful Streamable-HTTP MCP server returning
+    // 401 for a missing `Mcp-Session-Id` header).
+    let authorization_server = match prm
         .as_ref()
         .and_then(|m| m.authorization_servers.first().cloned())
-        .unwrap_or_else(|| server_url.to_string());
+    {
+        Some(as_url) => as_url,
+        None => {
+            let www_auth_hint = www_auth_raw
+                .as_deref()
+                .map(|s| format!("; WWW-Authenticate: {s}"))
+                .unwrap_or_else(|| "; no WWW-Authenticate header".to_string());
+            anyhow::bail!(
+                "remote MCP server at {server_url} returned 401 Unauthorized but did not \
+                 advertise an authorization server{www_auth_hint}. No \
+                 Protected Resource Metadata document was discoverable at the \
+                 well-known endpoints either. Refusing to start an OAuth flow against \
+                 an unknown authorization server. If this server uses a non-OAuth auth \
+                 scheme (e.g. a static bearer token or a stateful `Mcp-Session-Id` \
+                 header), re-run with --no-auth (optionally combined with --header to \
+                 pass a static credential), or fix the server to emit a spec-compliant \
+                 `WWW-Authenticate: Bearer resource_metadata=\"...\"` response"
+            );
+        }
+    };
 
     Ok(AuthRequirement::Required(OAuthDiscovery {
         authorization_server,
@@ -612,7 +643,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_falls_back_to_server_url_when_no_prm() {
+    async fn discover_skips_oauth_when_static_authorization_is_accepted() {
+        // Spin up a mock that *requires* a static `Authorization: Bearer ...`
+        // header on the probe: requests without it get 401, requests with
+        // the expected value get 200. This proves two things at once:
+        //   1. discover() forwards user-supplied --header values on the
+        //      probe request (otherwise the mock would 401 and we'd bail).
+        //   2. A 2xx probe short-circuits to `AuthRequirement::None`, so
+        //      no PRM lookup, no OAuth state machine, no browser.
+        async fn gated(headers: AxumHeaderMap) -> axum::response::Response {
+            match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                Some("Bearer good-token") => (AxumStatus::OK, "ok").into_response(),
+                _ => (AxumStatus::UNAUTHORIZED, "need bearer").into_response(),
+            }
+        }
+
+        let app = Router::new().route("/mcp", get(gated));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let _h = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let server_url = format!("http://{addr}/mcp");
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer good-token"),
+        );
+
+        let client = reqwest::Client::new();
+        let out = discover(&client, &server_url, &headers, None)
+            .await
+            .expect("discover");
+        assert!(
+            matches!(out, AuthRequirement::None),
+            "static Authorization accepted by server must short-circuit to None (no OAuth)"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_bails_on_401_without_www_authenticate_or_prm() {
+        // Regression: a server that returns a bare 401 with neither a
+        // WWW-Authenticate header nor a discoverable PRM document gives us
+        // no actionable authorization-server URL. Previous behaviour was to
+        // silently treat the resource URL itself as the authorization
+        // server, which sent us chasing OAuth metadata against servers
+        // that don't speak OAuth at all (e.g. stateful Streamable-HTTP
+        // servers that 401 on a missing `Mcp-Session-Id` header).
         let state = Arc::new(MockState {
             probe: ProbeBehavior::Unauthorized {
                 www_authenticate: None,
@@ -624,18 +705,21 @@ mod tests {
         let server_url = format!("{base}/mcp");
 
         let client = reqwest::Client::new();
-        let out = discover(&client, &server_url, &empty_headers(), None)
+        let err = discover(&client, &server_url, &empty_headers(), None)
             .await
-            .expect("discover");
-        match out {
-            AuthRequirement::Required(d) => {
-                assert_eq!(
-                    d.authorization_server, server_url,
-                    "server URL must be the fallback authorization server"
-                );
-                assert!(d.scopes.is_empty(), "no scope information available");
-            }
-            AuthRequirement::None => panic!("expected Required"),
-        }
+            .expect_err("must refuse to invent an authorization server");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not advertise an authorization server"),
+            "error should explain the missing AS metadata; got: {msg}"
+        );
+        assert!(
+            msg.contains("Mcp-Session-Id") || msg.contains("WWW-Authenticate"),
+            "error should hint at common causes; got: {msg}"
+        );
+        assert!(
+            msg.contains("--no-auth"),
+            "error should point users at the --no-auth escape hatch; got: {msg}"
+        );
     }
 }
