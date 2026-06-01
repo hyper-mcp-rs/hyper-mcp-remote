@@ -10,6 +10,7 @@
 
 mod auth;
 mod cli;
+mod filter;
 mod headers;
 mod logging;
 mod proxy;
@@ -24,6 +25,7 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
+use crate::filter::ToolFilter;
 use crate::proxy::{KeepaliveConfig, ProxyHandler};
 use crate::session::{CredentialKey, SessionHash};
 
@@ -60,12 +62,17 @@ async fn main() -> Result<()> {
         .context("failed to build remote transport")?;
 
     let keepalive = KeepaliveConfig::from_secs(cli.ping_interval_secs, cli.ping_timeout_secs);
+    let tool_filter = ToolFilter::from_cli(&cli.allow_tools, &cli.deny_tools)
+        .context("failed to compile tool filter patterns")?;
     tracing::info!(
         ping_interval_secs = cli.ping_interval_secs,
         ping_timeout_secs = cli.ping_timeout_secs,
+        allow_tool_patterns = cli.allow_tools.len(),
+        deny_tool_patterns = cli.deny_tools.len(),
+        tool_filter_active = !tool_filter.is_noop(),
         "Starting hyper-mcp-remote"
     );
-    let handler = ProxyHandler::new(transport, keepalive);
+    let handler = ProxyHandler::new(transport, keepalive, tool_filter);
     let ct = CancellationToken::new();
     let running =
         serve_directly_with_ct::<RoleServer, _, _, _, _>(handler, stdio(), None, ct.clone());

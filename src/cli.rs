@@ -93,6 +93,23 @@ pub struct Cli {
     /// liveness.
     #[arg(long, value_name = "SECS", default_value_t = 10)]
     pub ping_timeout_secs: u64,
+
+    /// Restrict the proxy to only forward tools whose name matches one of
+    /// these glob patterns. May be specified multiple times; values may
+    /// also be comma-separated. When omitted, every tool the remote
+    /// advertises is forwarded (subject to `--deny-tool`).
+    ///
+    /// Patterns are globs (`*`, `?`, `[abc]`) matched against the full
+    /// tool name. Example: `--allow-tool 'read_*,search_*'`.
+    #[arg(long = "allow-tool", value_name = "PATTERN")]
+    pub allow_tools: Vec<String>,
+
+    /// Drop any tool whose name matches one of these glob patterns. Applied
+    /// after `--allow-tool`, so `--allow-tool 'read_*' --deny-tool
+    /// 'read_secrets'` allows the family minus that one. Repeatable; values
+    /// may also be comma-separated.
+    #[arg(long = "deny-tool", value_name = "PATTERN")]
+    pub deny_tools: Vec<String>,
 }
 
 impl Cli {
@@ -244,6 +261,35 @@ mod tests {
         assert!(!cli.no_auth);
         assert_eq!(cli.ping_interval_secs, 60);
         assert_eq!(cli.ping_timeout_secs, 10);
+        assert!(cli.allow_tools.is_empty());
+        assert!(cli.deny_tools.is_empty());
+    }
+
+    #[test]
+    fn parses_repeated_tool_filter_flags() {
+        let cli = cli_with(&[
+            "--allow-tool",
+            "read_*",
+            "--allow-tool",
+            "search",
+            "--deny-tool",
+            "read_secrets",
+            "https://example.com/mcp",
+        ]);
+        assert_eq!(cli.allow_tools, vec!["read_*", "search"]);
+        assert_eq!(cli.deny_tools, vec!["read_secrets"]);
+        // Filter values are opaque to `validate()`; they're compiled later
+        // by `ToolFilter::from_cli`, so validation must still pass.
+        cli.validate().expect("tool filter flags must validate");
+    }
+
+    #[test]
+    fn parses_comma_separated_tool_filter_value() {
+        // Clap stores the raw value verbatim; comma-splitting happens in
+        // `ToolFilter::from_cli`. We just confirm clap doesn't reject the
+        // string and that it's preserved.
+        let cli = cli_with(&["--allow-tool", "a,b,c", "https://example.com/mcp"]);
+        assert_eq!(cli.allow_tools, vec!["a,b,c"]);
     }
 
     #[test]

@@ -22,6 +22,10 @@ ctor = "1.0"
 directories = "5"
 dirs = "5"
 futures = "0.3"
+# Glob matching for tool name allow/deny lists. Backed by `regex-automata`,
+# which is already in the dep tree via `tracing-subscriber`, so this adds no
+# new transitive surface of any consequence.
+globset = "0.4"
 hex = "0.4"
 http = "1"
 # Direct dep for the `TokenResponse` trait so we can inspect cached

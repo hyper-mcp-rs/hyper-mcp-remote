@@ -49,6 +49,7 @@ use tokio::sync::OnceCell;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
+use crate::filter::ToolFilter;
 use crate::transport::RemoteTransport;
 
 // ---------------------------------------------------------------------------
@@ -269,16 +270,26 @@ pub struct ProxyHandler {
     transport: Mutex<Option<RemoteTransport>>,
     remote: OnceCell<Remote>,
     keepalive: KeepaliveConfig,
+    /// Allow/deny patterns applied to the remote's tool catalog. Enforced
+    /// on both `list_tools` (so the local client never sees filtered tools)
+    /// and `call_tool` (so clients that cached an earlier listing or follow
+    /// a server advertising `listChanged: false` can't bypass the filter).
+    tool_filter: ToolFilter,
 }
 
 impl ProxyHandler {
     /// Wrap a freshly built [`RemoteTransport`]. The remote connection is
     /// not opened until the local client sends `initialize`.
-    pub fn new(transport: RemoteTransport, keepalive: KeepaliveConfig) -> Self {
+    pub fn new(
+        transport: RemoteTransport,
+        keepalive: KeepaliveConfig,
+        tool_filter: ToolFilter,
+    ) -> Self {
         Self {
             transport: Mutex::new(Some(transport)),
             remote: OnceCell::new(),
             keepalive,
+            tool_filter,
         }
     }
 
@@ -406,7 +417,32 @@ impl ServerHandler for ProxyHandler {
         request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        self.peer()?.list_tools(request).await.map_err(remote_error)
+        let mut result = self
+            .peer()?
+            .list_tools(request)
+            .await
+            .map_err(remote_error)?;
+        // Filter the per-page response in place. We deliberately do **not**
+        // re-aggregate across pages to keep page sizes uniform: the remote
+        // owns the pagination cursor and stitching pages together client-
+        // side would break that contract for negligible UX gain. The local
+        // client just sees variable-sized pages, which is already allowed
+        // by the MCP spec.
+        if !self.tool_filter.is_noop() {
+            let before = result.tools.len();
+            result
+                .tools
+                .retain(|t| self.tool_filter.permits(t.name.as_ref()));
+            let dropped = before - result.tools.len();
+            if dropped > 0 {
+                tracing::debug!(
+                    dropped,
+                    kept = result.tools.len(),
+                    "tool filter applied to list_tools page"
+                );
+            }
+        }
+        Ok(result)
     }
 
     #[tracing::instrument(skip_all, fields(dir = "local→remote", tool = %request.name))]
@@ -415,6 +451,9 @@ impl ServerHandler for ProxyHandler {
         request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Enforce the filter **before** consulting the peer so a denied
+        // call never touches the network.
+        enforce_tool_filter(&self.tool_filter, &request.name)?;
         self.peer()?.call_tool(request).await.map_err(remote_error)
     }
 
@@ -658,6 +697,24 @@ async fn ping_remote(peer: &Peer<RoleClient>, timeout: Duration) {
     }
 }
 
+/// Reject a `tools/call` for a name the active [`ToolFilter`] does not
+/// admit. Returns `METHOD_NOT_FOUND` rather than `INVALID_PARAMS` because,
+/// as far as the local client is concerned, the tool simply does not exist
+/// on this proxy. Factored out so it can be unit-tested without a live
+/// remote: the guard must run before the proxy ever asks for its peer, so
+/// a covering test exercises it as a pure function.
+fn enforce_tool_filter(filter: &ToolFilter, name: &str) -> Result<(), ErrorData> {
+    if filter.permits(name) {
+        return Ok(());
+    }
+    tracing::info!(tool = %name, "refusing filtered tool call");
+    Err(ErrorData::new(
+        ErrorCode::METHOD_NOT_FOUND,
+        format!("tool {name:?} is not available on this proxy"),
+        None,
+    ))
+}
+
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::new(ErrorCode::INTERNAL_ERROR, msg.into(), None)
 }
@@ -753,6 +810,34 @@ mod tests {
         // timeout on every probe.
         let cfg = KeepaliveConfig::from_secs(30, 0);
         assert_eq!(cfg.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn enforce_tool_filter_allows_permitted_name() {
+        let filter = ToolFilter::allow_all();
+        enforce_tool_filter(&filter, "anything").expect("allow-all must permit");
+    }
+
+    #[test]
+    fn enforce_tool_filter_rejects_denied_name_with_method_not_found() {
+        // A deny-only filter is the easiest way to construct a non-trivial
+        // case where one specific name is rejected.
+        let filter = ToolFilter::from_cli(&[], &["read_secrets".to_string()]).expect("build");
+        let err = enforce_tool_filter(&filter, "read_secrets")
+            .expect_err("denied tool must produce an error");
+        assert_eq!(
+            err.code,
+            ErrorCode::METHOD_NOT_FOUND,
+            "filtered tools must surface as METHOD_NOT_FOUND so clients treat them as nonexistent"
+        );
+        assert!(
+            err.message.contains("read_secrets"),
+            "error must name the offending tool; got {:?}",
+            err.message
+        );
+        // A non-matching name should still be admitted.
+        enforce_tool_filter(&filter, "read_file")
+            .expect("non-matching name must still be admitted");
     }
 
     #[test]

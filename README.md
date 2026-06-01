@@ -64,6 +64,8 @@ store. Subsequent launches start with **no user interaction**.
 - 💓 **Keepalive pings** — periodic MCP `ping` requests keep the remote
   session warm across idle load-balancers, NATs, and server-side timeouts,
   with an early log-visible signal when the upstream becomes unreachable.
+- 🧹 **Tool filtering** — allow/deny tool names with glob patterns when an
+  upstream publishes more tools than your client actually needs.
 
 ## Installation
 
@@ -188,6 +190,8 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | `--no-auth`                       | Skip OAuth discovery entirely; talk to the server anonymously (or with whatever `--header` values you supply). For non-spec-compliant servers — see *Anonymous (no-OAuth) servers* below. |
 | `--ping-interval-secs <SECS>`     | Interval between MCP `ping` requests sent to the remote to keep its session alive. Set to `0` to disable. Default: `60`.                             |
 | `--ping-timeout-secs <SECS>`      | Per-ping timeout. A timed-out ping is logged but does not tear the session down — the transport remains the authority on liveness. Default: `10`.    |
+| `--allow-tool <PATTERN>`          | Only forward tools whose name matches this glob pattern. Repeatable; values may also be comma-separated. See *Filtering the tool catalog* below.     |
+| `--deny-tool <PATTERN>`           | Drop tools whose name matches this glob pattern. Applied after `--allow-tool`. Repeatable; values may also be comma-separated.                       |
 | `-h`, `--help`                    | Print help.                                                                                                                                          |
 | `-V`, `--version`                 | Print version.                                                                                                                                       |
 
@@ -291,6 +295,50 @@ Tune or disable as needed:
 }
 ```
 
+### Filtering the tool catalog
+
+Some upstream MCP servers publish a large catalog of tools, much of which
+is irrelevant in any given client environment, and not every server lets
+you trim the list server-side. `--allow-tool` and `--deny-tool` give you a
+client-side filter that the proxy enforces on both `list_tools` (so your
+client never sees the hidden tools) **and** `call_tool` (so a client that
+cached an earlier listing still can't invoke them).
+
+Patterns are globs, not regex: `*` matches anything, `?` matches one
+character, and `[abc]` character classes work. Patterns are matched
+verbatim against the full tool name.
+
+Semantics:
+
+- With no flags, the filter is a no-op — every tool the remote advertises
+  is forwarded.
+- If any `--allow-tool` patterns are present, only tools matching at least
+  one of them are eligible to pass.
+- Then any `--deny-tool` match removes the tool. **Deny beats allow.**
+
+Example — expose only the read-side of a server, except for `read_secrets`:
+
+```jsonc
+{
+  "mcpServers": {
+    "gitlab": {
+      "command": "hyper-mcp-remote",
+      "args": [
+        "https://gitlab.com/api/v4/mcp",
+        "--allow-tool", "read_*,search_*",
+        "--deny-tool", "read_secrets"
+      ]
+    }
+  }
+}
+```
+
+A refused `tools/call` returns a standard `METHOD_NOT_FOUND` error so the
+client treats the tool as nonexistent rather than "present but failing".
+Filtering is applied per response page; the upstream's pagination cursor is
+forwarded untouched, so page sizes the client sees may be smaller than the
+upstream's, but the listing as a whole is still consistent.
+
 ## Where things live
 
 | Item                | Location                                                                                                                                                                                                                  |
@@ -376,6 +424,7 @@ browser.
 src/
 ├── main.rs        # binary entrypoint, signal handling, wiring
 ├── cli.rs         # clap argument definitions and validation
+├── filter.rs      # --allow-tool / --deny-tool glob filter
 ├── headers.rs     # --header parsing + ${ENV} interpolation
 ├── logging.rs     # rolling-file tracing setup (installed via #[ctor])
 ├── proxy.rs       # bidirectional stdio ⇄ HTTP MCP forwarder
