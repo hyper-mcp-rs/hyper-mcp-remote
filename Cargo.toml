@@ -1,6 +1,6 @@
 [package]
 name = "hyper-mcp-remote"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 authors = ["Joseph Wortmann <joseph.wortmann@gmail.com>"]
 description = "A stdio to streamable-http MCP proxy with OAuth support"
