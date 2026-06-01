@@ -112,11 +112,68 @@ pub async fn acquire_auth_client(
         .context("failed to load cached credentials")?
         && let Some(token) = cached.token_response.clone()
     {
-        tracing::info!("found cached OAuth credentials; using them");
+        // Detect staleness BEFORE handing the token to rmcp.
+        // `OAuthState::set_credentials` unconditionally overwrites
+        // `token_received_at` with the current time when it persists the
+        // restored credentials (see rmcp 1.7 transport/auth.rs L2325), so
+        // by the time we'd ask `get_access_token` it would compute
+        // `elapsed = 0` and treat an actually-expired token as fresh.
+        // We have to make the expiry call ourselves, using the genuine
+        // `token_received_at` we just loaded.
+        let stale = cached_access_token_is_stale(&cached);
+        tracing::info!(
+            stale_cached_token = stale,
+            token_received_at = ?cached.token_received_at,
+            "found cached OAuth credentials; using them"
+        );
         state
             .set_credentials(&cached.client_id, token)
             .await
             .context("failed to apply cached credentials")?;
+
+        // `set_credentials` just clobbered `token_received_at` on disk
+        // with the current time. That would lie to every future launch
+        // (this one observed the lie when investigating the GitLab cache
+        // failure: the genuine timestamp was overwritten on a previous
+        // run, making an expired access token look fresh forever). Write
+        // the original `StoredCredentials` back so the next launch sees
+        // the truth.
+        if let Err(e) = store.as_ref().save_via_trait(cached.clone()).await {
+            tracing::warn!(
+                error = %e,
+                "could not restore genuine token_received_at after set_credentials; \
+                 future launches may incorrectly treat an expired token as fresh"
+            );
+        }
+
+        if stale {
+            // We're now in `Authorized` with the wrong `received_at`.
+            // Force a refresh so the cache (and the in-memory token rmcp
+            // will hand to the transport) reflect a genuinely-fresh
+            // access token. If the refresh fails because the refresh
+            // token itself is no good, wipe the cache so the next launch
+            // can run a clean interactive flow.
+            tracing::info!(
+                "cached access token is expired or within refresh buffer; refreshing now"
+            );
+            match state.refresh_token().await {
+                Ok(()) => tracing::info!("refresh succeeded; cached credentials are current"),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not refresh expired cached credentials; clearing cache"
+                    );
+                    let _ = store.clear_sync();
+                    anyhow::bail!(
+                        "cached OAuth credentials are expired and the refresh \
+                         token could not be exchanged ({e}). The credential \
+                         cache has been cleared; re-run hyper-mcp-remote to \
+                         start a fresh OAuth flow"
+                    );
+                }
+            }
+        }
+
         return Ok(AuthOutcome::Authorized {
             client: into_auth_client(state, http_client)?,
         });
@@ -138,6 +195,11 @@ trait CredentialStoreExt {
     async fn load_via_trait(
         &self,
     ) -> Result<Option<rmcp::transport::auth::StoredCredentials>, rmcp::transport::auth::AuthError>;
+
+    async fn save_via_trait(
+        &self,
+        creds: rmcp::transport::auth::StoredCredentials,
+    ) -> Result<(), rmcp::transport::auth::AuthError>;
 }
 
 #[async_trait::async_trait]
@@ -147,6 +209,13 @@ impl CredentialStoreExt for SecureCredentialStore {
     ) -> Result<Option<rmcp::transport::auth::StoredCredentials>, rmcp::transport::auth::AuthError>
     {
         <Self as rmcp::transport::auth::CredentialStore>::load(self).await
+    }
+
+    async fn save_via_trait(
+        &self,
+        creds: rmcp::transport::auth::StoredCredentials,
+    ) -> Result<(), rmcp::transport::auth::AuthError> {
+        <Self as rmcp::transport::auth::CredentialStore>::save(self, creds).await
     }
 }
 
@@ -269,6 +338,38 @@ fn into_auth_client(state: OAuthState, http_client: HttpClient) -> Result<AuthCl
     Ok(AuthClient::new(http_client, manager))
 }
 
+/// Number of seconds before nominal expiry at which we treat a cached
+/// access token as effectively expired and trigger a proactive refresh.
+/// Mirrors `AuthorizationManager::REFRESH_BUFFER_SECS` in rmcp so that the
+/// two checks agree on what "about to expire" means.
+const REFRESH_BUFFER_SECS: u64 = 30;
+
+/// True if the cached access token has expired, or is within
+/// [`REFRESH_BUFFER_SECS`] of expiring, according to the genuine
+/// `token_received_at` from our credential store. Returns `false` when
+/// the cache lacks the information needed to make the call (no
+/// `token_received_at`, no `expires_in`, missing `token_response`) so we
+/// don't refresh-storm caches that pre-date timestamping.
+fn cached_access_token_is_stale(cached: &rmcp::transport::auth::StoredCredentials) -> bool {
+    use oauth2::TokenResponse;
+
+    let Some(received_at) = cached.token_received_at else {
+        return false;
+    };
+    let Some(token) = cached.token_response.as_ref() else {
+        return false;
+    };
+    let Some(expires_in) = token.expires_in() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let elapsed = now.saturating_sub(received_at);
+    expires_in.as_secs().saturating_sub(elapsed) < REFRESH_BUFFER_SECS
+}
+
 fn build_http_client() -> Result<HttpClient> {
     HttpClient::builder()
         .user_agent(concat!(
@@ -344,6 +445,92 @@ mod tests {
             "CLI override of all-whitespace must produce empty list, got {scopes:?}"
         );
     }
+
+    // -- cached_access_token_is_stale -----------------------------------
+
+    fn sample_stored(
+        token_received_at: Option<u64>,
+        expires_in_secs: Option<u64>,
+    ) -> rmcp::transport::auth::StoredCredentials {
+        // Build a StoredCredentials via JSON to avoid pulling in oauth2's
+        // builder API just to construct one; this mirrors what rmcp itself
+        // writes to disk.
+        let mut token = serde_json::json!({
+            "access_token": "cached-access",
+            "token_type": "bearer",
+            "refresh_token": "cached-refresh",
+        });
+        if let Some(secs) = expires_in_secs {
+            token["expires_in"] = serde_json::Value::from(secs);
+        }
+        let stored = serde_json::json!({
+            "client_id": "client-abc",
+            "token_response": token,
+            "granted_scopes": [],
+            "token_received_at": token_received_at,
+        });
+        serde_json::from_value(stored).expect("sample StoredCredentials must deserialize")
+    }
+
+    fn now_epoch_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_secs()
+    }
+
+    #[test]
+    fn stale_when_received_long_ago_with_short_expiry() {
+        // Token received 2 hours ago, expires_in=3600 -> expired by an hour.
+        let stored = sample_stored(Some(now_epoch_secs() - 7200), Some(3600));
+        assert!(
+            cached_access_token_is_stale(&stored),
+            "a 1h token received 2h ago must be flagged stale"
+        );
+    }
+
+    #[test]
+    fn stale_when_within_refresh_buffer() {
+        // Token expires in REFRESH_BUFFER_SECS - 1 seconds: still nominally
+        // valid but inside the proactive-refresh window.
+        let stored = sample_stored(
+            Some(now_epoch_secs() - (3600 - (REFRESH_BUFFER_SECS - 1))),
+            Some(3600),
+        );
+        assert!(
+            cached_access_token_is_stale(&stored),
+            "token within REFRESH_BUFFER_SECS of expiry must be flagged stale"
+        );
+    }
+
+    #[test]
+    fn fresh_when_well_inside_validity_window() {
+        let stored = sample_stored(Some(now_epoch_secs() - 60), Some(3600));
+        assert!(
+            !cached_access_token_is_stale(&stored),
+            "a 1h token received 1min ago must be fresh"
+        );
+    }
+
+    #[test]
+    fn fresh_when_no_received_at_to_compare_against() {
+        // Legacy cache entries written before token_received_at was tracked
+        // must NOT be eagerly refreshed; that would refresh-storm on every
+        // launch for users with old caches.
+        let stored = sample_stored(None, Some(3600));
+        assert!(!cached_access_token_is_stale(&stored));
+    }
+
+    #[test]
+    fn fresh_when_no_expires_in_to_compare_against() {
+        // A token without expires_in is treated as non-expiring as far as
+        // proactive refresh is concerned; the server is the source of
+        // truth and a reactive 401 will surface as a transport error.
+        let stored = sample_stored(Some(now_epoch_secs() - 86_400), None);
+        assert!(!cached_access_token_is_stale(&stored));
+    }
+
+    // --------------------------------------------------------------------
 
     #[test]
     fn build_http_client_succeeds() {

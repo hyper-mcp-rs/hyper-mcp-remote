@@ -822,6 +822,7 @@ dependencies = [
  "hex",
  "http",
  "keyring",
+ "oauth2",
  "reqwest",
  "rmcp",
  "serde",

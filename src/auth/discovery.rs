@@ -165,33 +165,45 @@ pub async fn discover(
     }
 
     // Pick the first authorization server advertised by the PRM document.
-    // We deliberately do NOT fall back to `server_url` here: the MCP
-    // authorization spec (and RFC 6750) require a server gating access on
-    // OAuth to advertise its authorization server, either via
-    // `WWW-Authenticate: Bearer resource_metadata="..."` or via a
-    // well-known PRM document. If we received a bare `401` with neither,
-    // we have no idea where to authenticate, and silently treating the
-    // resource URL as its own authorization server typically just sends us
-    // chasing OAuth metadata against a server that doesn't speak OAuth at
-    // all (common symptom: a stateful Streamable-HTTP MCP server returning
-    // 401 for a missing `Mcp-Session-Id` header).
+    //
+    // If PRM didn't give us one, the server's intent depends on whether
+    // it sent a `WWW-Authenticate` challenge at all:
+    //
+    //   * Header present (e.g. `Bearer realm="OAuth", error="..."`) — the
+    //     server is explicitly demanding OAuth, it's just not telling us
+    //     where. Many real deployments (e.g. mcp.atlassian.com) host
+    //     RFC 8414 metadata at the server's origin even though they don't
+    //     publish a PRM document or a `resource_metadata=...` link, so we
+    //     fall back to using the resource URL itself as the starting
+    //     point for RFC 8414 discovery. This matches the behaviour of
+    //     the Node `mcp-remote` reference implementation.
+    //   * Header absent — we have no signal that OAuth is what's being
+    //     asked for. The likely failure mode is a stateful
+    //     Streamable-HTTP server returning 401 for a missing
+    //     `Mcp-Session-Id` (or similar). Bail with actionable guidance
+    //     rather than inventing an authorization server and chasing
+    //     OAuth metadata against a non-OAuth server.
     let authorization_server = match prm
         .as_ref()
         .and_then(|m| m.authorization_servers.first().cloned())
     {
         Some(as_url) => as_url,
+        None if www_auth_raw.is_some() => {
+            tracing::debug!(
+                server_url,
+                www_authenticate = ?www_auth_raw,
+                "401 carries a WWW-Authenticate challenge but no PRM or resource_metadata link; \
+                 falling back to server URL for RFC 8414 discovery"
+            );
+            server_url.to_string()
+        }
         None => {
-            let www_auth_hint = www_auth_raw
-                .as_deref()
-                .map(|s| format!("; WWW-Authenticate: {s}"))
-                .unwrap_or_else(|| "; no WWW-Authenticate header".to_string());
             anyhow::bail!(
-                "remote MCP server at {server_url} returned 401 Unauthorized but did not \
-                 advertise an authorization server{www_auth_hint}. No \
-                 Protected Resource Metadata document was discoverable at the \
-                 well-known endpoints either. Refusing to start an OAuth flow against \
-                 an unknown authorization server. If this server uses a non-OAuth auth \
-                 scheme (e.g. a static bearer token or a stateful `Mcp-Session-Id` \
+                "remote MCP server at {server_url} returned 401 Unauthorized with no \
+                 WWW-Authenticate header, and no Protected Resource Metadata document was \
+                 discoverable at the well-known endpoints. Refusing to start an OAuth flow \
+                 against an unknown authorization server. If this server uses a non-OAuth \
+                 auth scheme (e.g. a static bearer token or a stateful `Mcp-Session-Id` \
                  header), re-run with --no-auth (optionally combined with --header to \
                  pass a static credential), or fix the server to emit a spec-compliant \
                  `WWW-Authenticate: Bearer resource_metadata=\"...\"` response"
@@ -686,6 +698,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_falls_back_to_server_url_when_www_authenticate_has_no_resource_metadata() {
+        // Atlassian-style: server returns 401 with a clear `Bearer` challenge
+        // (so it's OAuth-shaped) but no `resource_metadata=` parameter and no
+        // discoverable PRM document. The previous over-strict bail regressed
+        // this case; the right behaviour is to fall back to using the
+        // resource URL itself as the AS starting point and let rmcp's
+        // RFC 8414 discovery find the metadata at the server's origin.
+        let state = Arc::new(MockState {
+            probe: ProbeBehavior::Unauthorized {
+                www_authenticate: Some(
+                    "Bearer realm=\"OAuth\", error=\"invalid_token\", \
+                     error_description=\"Missing or invalid access token\""
+                        .to_string(),
+                ),
+            },
+            prm_body: None, // 404 on PRM endpoints
+            prm_hits: AtomicUsize::new(0),
+        });
+        let (base, _h) = spawn_mock(state).await;
+        let server_url = format!("{base}/mcp");
+
+        let client = reqwest::Client::new();
+        let out = discover(&client, &server_url, &empty_headers(), None)
+            .await
+            .expect("discover must NOT bail when a Bearer challenge is present");
+        match out {
+            AuthRequirement::Required(d) => {
+                assert_eq!(
+                    d.authorization_server, server_url,
+                    "with a Bearer challenge but no resource_metadata/PRM, fall back to \
+                     the resource URL as the AS so RFC 8414 discovery can find metadata at \
+                     the server's origin"
+                );
+            }
+            AuthRequirement::None => panic!("expected Required, got None"),
+        }
+    }
+
+    #[tokio::test]
     async fn discover_bails_on_401_without_www_authenticate_or_prm() {
         // Regression: a server that returns a bare 401 with neither a
         // WWW-Authenticate header nor a discoverable PRM document gives us
@@ -710,8 +761,8 @@ mod tests {
             .expect_err("must refuse to invent an authorization server");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("did not advertise an authorization server"),
-            "error should explain the missing AS metadata; got: {msg}"
+            msg.contains("no WWW-Authenticate header"),
+            "error should explain the missing OAuth signal; got: {msg}"
         );
         assert!(
             msg.contains("Mcp-Session-Id") || msg.contains("WWW-Authenticate"),

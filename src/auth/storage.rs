@@ -61,10 +61,32 @@ impl SecureCredentialStore {
 
     /// Wipe any cached credentials for this session from both keyring and
     /// disk. Used by `--reset-auth` and explicit logout flows.
+    ///
+    /// Keyring errors are logged but not propagated: a missing entry is a
+    /// success for our purposes, and a transient keyring failure shouldn't
+    /// stop us from at least clearing the file fallback. We do, however,
+    /// distinguish "no entry" from "delete failed" in the logs, because
+    /// the latter previously hid a real bug where `--reset-auth` reported
+    /// success but left the credential intact (e.g. duplicate keychain
+    /// items the keyring crate's delete path doesn't fully reap).
     pub fn clear_sync(&self) -> Result<()> {
-        // Best-effort delete from keyring.
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &self.account) {
-            let _ = entry.delete_credential();
+        match keyring::Entry::new(KEYRING_SERVICE, &self.account) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) => tracing::debug!(
+                    account = %self.account,
+                    "deleted keyring entry"
+                ),
+                Err(keyring::Error::NoEntry) => tracing::debug!(
+                    account = %self.account,
+                    "keyring entry was already absent"
+                ),
+                Err(e) => tracing::warn!(
+                    account = %self.account,
+                    error = %e,
+                    "keyring delete failed; entry may still be present"
+                ),
+            },
+            Err(e) => tracing::warn!(error = %e, "could not open keyring entry to delete"),
         }
         if self.fallback_path.exists() {
             std::fs::remove_file(&self.fallback_path).with_context(|| {
