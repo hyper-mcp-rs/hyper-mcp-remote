@@ -124,6 +124,9 @@ impl ClientHandler for RemoteClientHandler {
     }
     // -- Requests originated by the remote server -------------------------
 
+    // Sampling is deprecated by SEP-2577, but we still forward it so clients
+    // that rely on it keep working while the remote supports it.
+    #[allow(deprecated)]
     #[tracing::instrument(skip_all, fields(dir = "remote←local"))]
     async fn create_message(
         &self,
@@ -136,6 +139,8 @@ impl ClientHandler for RemoteClientHandler {
             .map_err(upstream_error)
     }
 
+    // Roots is deprecated by SEP-2577; forwarded for compatibility.
+    #[allow(deprecated)]
     #[tracing::instrument(skip_all, fields(dir = "remote←local"))]
     async fn list_roots(
         &self,
@@ -182,6 +187,8 @@ impl ClientHandler for RemoteClientHandler {
         }
     }
 
+    // Logging is deprecated by SEP-2577; forwarded for compatibility.
+    #[allow(deprecated)]
     #[tracing::instrument(level = "debug", skip_all, fields(dir = "remote→local"))]
     async fn on_logging_message(
         &self,
@@ -345,7 +352,7 @@ impl ProxyHandler {
                 // implementation so a curious client can tell the difference.
                 let mut init_result = running
                     .peer_info()
-                    .cloned()
+                    .map(|info| (*info).clone())
                     .unwrap_or_else(|| InitializeResult::new(ServerCapabilities::default()));
                 init_result.server_info =
                     Implementation::new("hyper-mcp-remote", env!("CARGO_PKG_VERSION"));
@@ -552,6 +559,8 @@ impl ServerHandler for ProxyHandler {
 
     // -- Logging ---------------------------------------------------------
 
+    // Logging is deprecated by SEP-2577; forwarded for compatibility.
+    #[allow(deprecated)]
     #[tracing::instrument(skip_all, fields(dir = "local→remote", level = ?request.level))]
     async fn set_level(
         &self,

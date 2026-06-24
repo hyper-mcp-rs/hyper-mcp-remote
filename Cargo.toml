@@ -19,25 +19,27 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
 ctor = "1.0"
-directories = "5"
-dirs = "5"
+directories = "6.0"
+dirs = "6.0"
 futures = "0.3"
 # Glob matching for tool name allow/deny lists. Backed by `regex-automata`,
 # which is already in the dep tree via `tracing-subscriber`, so this adds no
 # new transitive surface of any consequence.
 globset = "0.4"
 hex = "0.4"
-http = "1"
+http = "1.4"
 # Direct dep for the `TokenResponse` trait so we can inspect cached
 # `OAuthTokenResponse` values (expires_in) when deciding whether to refresh.
 # Version pinned to match rmcp 1.7's transitive selection in Cargo.lock.
-oauth2 = { version = "5", default-features = false }
-keyring = { version = "3", features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-    "vendored",
-] }
+oauth2 = { version = "5.0", default-features = false }
+# keyring 4.x is a rewrite layered over `keyring-core` with pluggable stores.
+# The `v1` feature restores the classic all-in-one `Entry` API and
+# auto-selects the platform store: Keychain (macOS), Credential Manager
+# (Windows), and Secret Service (Linux/*nix). This replaces the old
+# per-backend feature flags (apple-native/windows-native/sync-secret-service)
+# and `vendored` (the Secret Service store now uses `crypto-rust`, so no
+# vendored OpenSSL is required).
+keyring = { version = "4.1", features = ["v1"] }
 # Must match rmcp 1.7's transport-streamable-http-client-reqwest reqwest version.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
@@ -45,7 +47,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "stream",
 ] }
-rmcp = { version = "1.7", features = [
+rmcp = { version = "1.8", features = [
     "server",
     "client",
     "transport-io",
@@ -54,25 +56,25 @@ rmcp = { version = "1.7", features = [
     "auth",
     "elicitation",
 ] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+thiserror = "2.0"
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
-webbrowser = "1"
+url = "2.5"
+webbrowser = "1.2"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27"
 axum = "0.8"
 # Pulls in `transport-child-process` so the integration test can drive the
 # compiled `hyper-mcp-remote` binary over its stdin/stdout. The feature is
 # additive: Cargo merges the dev-deps feature set with the bin's.
-rmcp = { version = "1.7", features = ["transport-child-process"] }
+rmcp = { version = "1.8", features = ["transport-child-process"] }
 
 [[bin]]
 name = "hyper-mcp-remote"
