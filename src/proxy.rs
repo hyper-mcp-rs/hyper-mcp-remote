@@ -32,14 +32,18 @@ use std::time::Duration;
 use anyhow::Result;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientInfo, ClientRequest,
-    CompleteRequestParams, CompleteResult, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult, ElicitationResponseNotificationParam,
-    ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult, Implementation,
-    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, ListRootsResult, ListToolsResult, LoggingMessageNotificationParam,
-    PaginatedRequestParams, PingRequest, ProgressNotificationParam, ReadResourceRequestParams,
-    ReadResourceResult, ResourceUpdatedNotificationParam, ServerCapabilities,
-    SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
+    CompleteRequestParams, CompleteResult, ElicitRequestParams, ElicitResult,
+    ElicitationResponseNotificationParam, ErrorCode, ErrorData, GetPromptRequestParams,
+    GetPromptResult, Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    PingRequest, ProgressNotificationParam, ReadResourceRequestParams, ReadResourceResult,
+    ResourceUpdatedNotificationParam, ServerCapabilities, SubscribeRequestParams,
+    UnsubscribeRequestParams,
+};
+#[allow(deprecated)] // Sampling, Roots, and Logging are deprecated by SEP-2577.
+use rmcp::model::{
+    CreateMessageRequestParams, CreateMessageResult, ListRootsResult,
+    LoggingMessageNotificationParam, SetLevelRequestParams,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, RoleClient, RoleServer, RunningService, ServiceExt,
@@ -152,9 +156,9 @@ impl ClientHandler for RemoteClientHandler {
     #[tracing::instrument(skip_all, fields(dir = "remote←local"))]
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         _ctx: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, ErrorData> {
+    ) -> Result<ElicitResult, ErrorData> {
         self.upstream
             .create_elicitation(request)
             .await

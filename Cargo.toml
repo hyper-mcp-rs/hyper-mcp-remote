@@ -47,7 +47,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "stream",
 ] }
-rmcp = { version = "1.8", features = [
+rmcp = { version = "2.0", features = [
     "server",
     "client",
     "transport-io",
@@ -74,7 +74,7 @@ axum = "0.8"
 # Pulls in `transport-child-process` so the integration test can drive the
 # compiled `hyper-mcp-remote` binary over its stdin/stdout. The feature is
 # additive: Cargo merges the dev-deps feature set with the bin's.
-rmcp = { version = "1.8", features = ["transport-child-process"] }
+rmcp = { version = "2.0", features = ["transport-child-process"] }
 
 [[bin]]
 name = "hyper-mcp-remote"
