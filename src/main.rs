@@ -16,6 +16,7 @@ mod logging;
 mod proxy;
 mod session;
 mod transport;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,6 +40,22 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     cli.validate().context("invalid CLI arguments")?;
+
+    // If requested, check for and apply an update before doing any other
+    // startup work. On a successful update this re-executes the new binary
+    // and never returns; on failure we log and continue with this version.
+    if cli.auto_update {
+        if cfg!(target_os = "windows") {
+            tracing::warn!(
+                "Auto-update is not supported on Windows; skipping check. \
+                 On Windows, the process ID changes after restart, which breaks \
+                 stdio MCP clients that track the child process. \
+                 Please upgrade by downloading a new release from GitHub."
+            );
+        } else if let Err(e) = update::run().await {
+            tracing::warn!(error = ?e, "Auto-update failed; continuing with the current version");
+        }
+    }
 
     let headers = headers::parse(&cli.headers).context("failed to parse --header arguments")?;
     let session = SessionHash::new(&cli.server_url, cli.resource.as_deref(), &headers);

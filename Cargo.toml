@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "external/auto-update"]
+
 [package]
 name = "hyper-mcp-remote"
 version = "0.2.1"
@@ -15,9 +18,10 @@ documentation = "https://github.com/hyper-mcp-rs/hyper-mcp-remote"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+auto-update = { path = "external/auto-update", version = "0.1.0" }
 axum = "0.8"
 base64 = "0.22"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 ctor = "1.0"
 directories = "6.0"
 dirs = "6.0"

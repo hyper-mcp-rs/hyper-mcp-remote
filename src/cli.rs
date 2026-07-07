@@ -20,6 +20,13 @@ use clap::Parser;
     about = "stdio -> Streamable HTTP MCP proxy with OAuth"
 )]
 pub struct Cli {
+    #[arg(
+        long = "auto-update",
+        help = "Before starting, check GitHub releases for a newer version. If one exists, download it, verify its SHA-256 checksum, replace this binary, and restart with the same arguments. (Not supported on Windows.)",
+        env = "HYPER_MCP_REMOTE_AUTO_UPDATE"
+    )]
+    pub auto_update: bool,
+
     /// URL of the remote MCP server (e.g. `https://example.com/mcp`).
     pub server_url: String,
 
