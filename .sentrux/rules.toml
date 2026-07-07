@@ -1,0 +1,77 @@
+# .sentrux/rules.toml — Architectural constraints for hyper-mcp-remote
+
+[constraints]
+# Quality signal gates (0–1 scale, higher = stricter)
+min_quality = 0.75
+min_modularity = 0.46
+min_acyclicity = 0.95
+min_depth = 0.88
+min_equality = 0.62
+min_redundancy = 0.95
+
+# Engineering limits
+max_cycles = 0
+max_cc = 25
+max_fn_lines = 200
+max_file_lines = 1000
+max_coupling_score = 0.35
+max_upward_violations = 5
+no_god_files = true
+
+# Per-language overrides
+[language.rust.constraints]
+max_cc = 30
+
+# Layer definitions — enforce proxy-centric architecture
+
+[[layers]]
+name = "core"
+paths = ["src/main.rs"]
+order = 0
+
+[[layers]]
+name = "transport"
+paths = ["src/transport.rs", "src/session.rs"]
+order = 1
+
+[[layers]]
+name = "proxy"
+paths = ["src/proxy.rs"]
+order = 2
+
+[[layers]]
+name = "auth"
+paths = ["src/auth/*"]
+order = 3
+
+[[layers]]
+name = "cli"
+paths = ["src/cli.rs"]
+order = 4
+
+[[layers]]
+name = "support"
+paths = ["src/filter.rs", "src/headers.rs", "src/logging.rs"]
+order = 5
+
+# Boundary rules — explicit dependency denials
+
+[[boundaries]]
+from = "src/auth/*"
+to = "src/proxy.rs"
+reason = "Auth layer must not depend on proxy logic"
+
+[[boundaries]]
+from = "src/cli.rs"
+to = "src/auth/*"
+reason = "CLI parsing must not depend on auth internals"
+
+[[boundaries]]
+from = "src/filter.rs"
+to = "src/auth/*"
+reason = "Tool filter must not depend on auth internals"
+
+[[boundaries]]
+from = "src/support/*"
+to = "src/auth/*"
+reason = "Support modules must not depend on auth internals"
