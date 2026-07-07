@@ -16,6 +16,7 @@ on:
       - "lefthook.yml"
       - ".sentrux/**"
       - "AGENTS.md"
+      - ".cargo/**"
   pull_request:
     branches: [main]
   workflow_dispatch:
