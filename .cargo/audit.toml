@@ -1,0 +1,17 @@
+# cargo-audit configuration.
+#
+# Mirrors the `[advisories].ignore` list in `deny.toml`. Keep these in sync:
+# `cargo audit` and `cargo deny check advisories` consult different config
+# files but should accept the same set of advisories.
+#
+# When you add or remove an entry here, do the same in `deny.toml` and add a
+# comment explaining the blocker (upstream issue, expected fix version, etc).
+
+[advisories]
+ignore = [
+    # quick-xml 0.38.4: unbounded namespace-declaration allocation (DoS) and
+    # quadratic run time on duplicate attribute names. Pulled in via
+    # self_update -> ureq -> ureq-proto. No compatible fix in current dep tree.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
