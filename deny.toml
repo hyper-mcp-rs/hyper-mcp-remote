@@ -25,16 +25,7 @@ all-features = true
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = [
-    {
-        id = "RUSTSEC-2026-0194",
-        reason = "quick-xml in self_update dependency chain; unfixable until auto-update updates its dependencies",
-    },
-    {
-        id = "RUSTSEC-2026-0195",
-        reason = "quick-xml in self_update dependency chain; unfixable until auto-update updates its dependencies",
-    },
-]
+ignore = []
 
 # ─────────────────────────────────────────────────────────────────────────
 # Licenses - allowlist model. This list is intentionally conservative for
