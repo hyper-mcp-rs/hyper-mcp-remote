@@ -65,6 +65,9 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
 ]
+# Windows system crates used by self_update and its dependencies.
+# Multiple versions are present due to Windows-specific crates evolving over time.
+# These are unavoidable transitive dependencies for Windows builds.
 exceptions = []
 
 # Don't require this crate (or any other `publish = false` workspace
@@ -96,6 +99,11 @@ skip = [
     "getrandom",
     "sha2",
     "thiserror",
+    "thiserror-impl",
+]
+skip-tree = [
+    # windows-sys: self_update pulls in both old and new versions for Windows support
+    { name = "windows-sys", version = "0.52" },
 ]
 skip-tree = []
 

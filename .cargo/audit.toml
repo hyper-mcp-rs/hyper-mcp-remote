@@ -1,3 +1,4 @@
-[advisories]
-RUSTSEC-2026-0194 = "allow"
-RUSTSEC-2026-0195 = "allow"
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "Cannot upgrade quick-xml without checking all dependents" },
+    { id = "RUSTSEC-2026-0195", reason = "Cannot upgrade quick-xml without checking all dependents" },
+]
