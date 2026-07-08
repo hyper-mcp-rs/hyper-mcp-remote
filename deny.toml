@@ -105,7 +105,6 @@ skip-tree = [
     # windows-sys: self_update pulls in both old and new versions for Windows support
     { name = "windows-sys", version = "0.52" },
 ]
-skip-tree = []
 
 # ─────────────────────────────────────────────────────────────────────────
 # Sources - only crates.io is allowed. Pulls from arbitrary git repos

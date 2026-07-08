@@ -1,4 +1,5 @@
+[advisories]
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "Cannot upgrade quick-xml without checking all dependents" },
-    { id = "RUSTSEC-2026-0195", reason = "Cannot upgrade quick-xml without checking all dependents" },
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
