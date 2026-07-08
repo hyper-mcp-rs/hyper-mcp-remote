@@ -4,7 +4,7 @@ WORKDIR /app
 RUN cargo install cargo-auditable
 
 COPY Cargo.toml Cargo.lock ./
-COPY build.rs ./
+COPY keys ./keys
 COPY src ./src
 RUN cargo fetch
 RUN cargo auditable build --release --locked
