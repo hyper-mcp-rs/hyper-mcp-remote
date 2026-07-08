@@ -60,8 +60,9 @@ rmcp = { version = "2.1", features = [
 # Feature "signatures" enables .verifying_keys() for ed25519ph signature verification.
 # Feature "rustls" for pure-Rust TLS (no OpenSSL dependency).
 self_update = { version = "0.44", features = ["signatures", "rustls"] }
-# Throttle + restart wrappers: limits check frequency and re-executes after update.
-self-update-extras = "0.1"
+# Throttle + restart + silence wrappers: limits check frequency, re-executes
+# after update, and diverts stdout so it can't corrupt the stdio MCP stream.
+self-update-extras = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"

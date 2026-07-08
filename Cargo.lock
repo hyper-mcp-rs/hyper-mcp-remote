@@ -2737,10 +2737,11 @@ dependencies = [
 
 [[package]]
 name = "self-update-extras"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe584045ef65aa5f6581fe0c0de540862f53d767e6bded6d107d95c0a61abccc"
+checksum = "6772997a338bfbd9cdb3268d8333fbfd612f9e85867fac536f11869574448f06"
 dependencies = [
+ "libc",
  "self_update",
 ]
 
