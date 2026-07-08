@@ -16,6 +16,7 @@ mod logging;
 mod proxy;
 mod session;
 mod transport;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -38,6 +39,12 @@ async fn main() -> Result<()> {
     let _ = &logging::install_panic_hook;
 
     let cli = Cli::parse();
+
+    // Check for --update flag immediately after parsing.
+    if cli.update {
+        update::update();
+    }
+
     cli.validate().context("invalid CLI arguments")?;
 
     let headers = headers::parse(&cli.headers).context("failed to parse --header arguments")?;

@@ -294,7 +294,7 @@ async fn run_interactive_flow(
         .context("failed to build authorization URL")?;
 
     // Print to stderr so the MCP host (which owns stdout) can surface it.
-    eprintln!("\nOpen this URL in your browser to authorize hyper-mcp-remote:\n{auth_url}\n");
+    tracing::warn!("\nOpen this URL in your browser to authorize hyper-mcp-remote:\n{auth_url}\n");
     match webbrowser::open(&auth_url) {
         Ok(_) => tracing::info!("opened authorization URL in default browser"),
         Err(e) => {

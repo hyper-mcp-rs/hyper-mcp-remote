@@ -56,6 +56,12 @@ rmcp = { version = "2.1", features = [
     "auth",
     "elicitation",
 ] }
+# Self-update support: checks GitHub releases, downloads, replaces binary.
+# Feature "signatures" enables .verifying_keys() for ed25519ph signature verification.
+# Feature "rustls" for pure-Rust TLS (no OpenSSL dependency).
+self_update = { version = "0.44", features = ["signatures", "rustls"] }
+# Throttle + restart wrappers: limits check frequency and re-executes after update.
+self-update-extras = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"

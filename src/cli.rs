@@ -110,6 +110,15 @@ pub struct Cli {
     /// may also be comma-separated.
     #[arg(long = "deny-tool", value_name = "PATTERN")]
     pub deny_tools: Vec<String>,
+
+    /// Perform a self-update check and exit.
+    ///
+    /// Checks the latest GitHub release for a newer version of
+    /// `hyper-mcp-remote`, downloads and replaces the binary if found
+    /// (with signature verification), then re-executes the binary.
+    /// On Windows, prints a warning and continues without restarting.
+    #[arg(long)]
+    pub update: bool,
 }
 
 impl Cli {
@@ -324,5 +333,17 @@ mod tests {
         ]);
         cli.validate()
             .expect("disabled pings should bypass the timeout check");
+    }
+
+    #[test]
+    fn parses_update_flag() {
+        let cli = cli_with(&["--update", "https://example.com/mcp"]);
+        assert!(cli.update, "--update must set the flag");
+    }
+
+    #[test]
+    fn update_flag_is_false_by_default() {
+        let cli = cli_with(&["https://example.com/mcp"]);
+        assert!(!cli.update, "--update must default to false");
     }
 }
