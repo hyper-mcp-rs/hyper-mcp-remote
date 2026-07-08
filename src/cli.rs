@@ -117,8 +117,23 @@ pub struct Cli {
     /// `hyper-mcp-remote`, downloads and replaces the binary if found
     /// (with signature verification), then re-executes the binary.
     /// On Windows, prints a warning and continues without restarting.
+    ///
+    /// By default the update runs silently and without prompting, so it is
+    /// safe when the process is a stdio MCP server (stdout carries the
+    /// protocol stream). Pass `--verbose` for an interactive, visible update
+    /// when running from a terminal.
     #[arg(long)]
     pub update: bool,
+
+    /// Make the self-update interactive and verbose.
+    ///
+    /// This flag only affects `--update`; it has no bearing on the proxy
+    /// server. When set, the updater prints its progress to stdout and
+    /// prompts for confirmation before replacing the binary, instead of
+    /// running silently. Use this only from a real terminal: the visible
+    /// output would corrupt a stdio MCP session.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 impl Cli {
@@ -345,5 +360,17 @@ mod tests {
     fn update_flag_is_false_by_default() {
         let cli = cli_with(&["https://example.com/mcp"]);
         assert!(!cli.update, "--update must default to false");
+    }
+
+    #[test]
+    fn parses_verbose_flag() {
+        let cli = cli_with(&["--update", "--verbose", "https://example.com/mcp"]);
+        assert!(cli.verbose, "--verbose must set the flag");
+    }
+
+    #[test]
+    fn verbose_flag_is_false_by_default() {
+        let cli = cli_with(&["--update", "https://example.com/mcp"]);
+        assert!(!cli.verbose, "--verbose must default to false");
     }
 }

@@ -1,10 +1,12 @@
 //! Self-update support using the `self_update` and `self_update_extras` crates.
 //!
-//! This module provides a blocking `run_update()` function that checks GitHub
+//! This module provides a blocking `update()` function that checks GitHub
 //! releases for newer versions of the binary, downloads and verifies them with
 //! ed25519ph signatures, installs them via self-replacement, and (on POSIX
 //! systems) re-executes the new binary.
 
+use self_update::errors::{Error, Result};
+use self_update::update::ReleaseUpdate;
 use self_update::{backends::github::Update, cargo_crate_version};
 use std::path::Path;
 use std::process::Command;
@@ -63,108 +65,112 @@ fn is_homebrew_installed(path: &Path) -> bool {
 
 /// Run the self-update flow.
 ///
-/// This is a blocking function that:
-/// 1. Configures the GitHub update backend
-/// 2. Wraps it in throttle::Update to limit check frequency
-/// 3. On non-Windows, wraps in restart::Update to re-execute after update
-/// 4. Calls .update() to perform the actual update
+/// When `verbose` is false (the default), the update runs silently and without
+/// prompting so it is safe to invoke while acting as a stdio MCP server. When
+/// `verbose` is true, `self_update` prints progress to stdout and prompts for
+/// confirmation, which is only appropriate from an interactive terminal.
 ///
-/// On Windows, prints a warning and runs the update without restart (the
-/// running binary continues until exit; the new binary takes effect on next launch).
-///
-/// All errors are logged internally and the function returns void.
-pub fn update() {
-    // Load the verifying key from the compiled-in public key file
-    let key_bytes = include_bytes!("../keys/ed25519.pub");
-    if key_bytes.len() != 32 {
-        tracing::error!("ed25519.pub must contain exactly 32 bytes");
-        return;
+/// This is the single place errors are handled: the composition bubbles any
+/// failure up via `Result` and it is logged here. The function itself returns
+/// nothing.
+pub fn update(verbose: bool) {
+    if let Err(e) = try_update(verbose) {
+        tracing::error!(%e, "self-update failed");
     }
-    let verifying_key = [*key_bytes];
+}
 
-    // Build the GitHub backend
-    let backend = match Update::configure()
-        .repo_owner("hyper-mcp-rs")
-        .repo_name("hyper-mcp-remote")
-        .bin_name("hyper-mcp-remote")
-        .identifier(&archive_identifier())
-        .current_version(cargo_crate_version!())
-        .verifying_keys(verifying_key)
-        .no_confirm(true)
-        .show_output(false)
-        .build()
-    {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(%e, "failed to build GitHub update backend");
-            return;
-        }
-    };
+/// Build, compose, and run the update, bubbling every error to [`update`].
+///
+/// The wrappers are layered `restart(silence(throttle(backend)))` so that, on
+/// POSIX, the silence redirect of fd 1 is restored before the restart wrapper
+/// re-executes the process.
+fn try_update(verbose: bool) -> Result<()> {
+    let backend = backend(verbose)?;
 
-    // Check if the executable is managed by Homebrew before proceeding with update
+    // Refuse to self-replace a Homebrew-managed executable.
     let current_bin_path = backend.bin_install_path();
     if is_homebrew_installed(&current_bin_path) {
         tracing::warn!(
             ?current_bin_path,
             "executable is managed by Homebrew; manual update required"
         );
-        return;
+        return Ok(());
     }
 
-    // Wrap in throttle to limit check frequency
-    let throttled = match self_update_extras::throttle::Update::configure()
-        .release_update(backend)
+    let updater = throttle(backend)?;
+    // Skip the stdout redirect only when the caller explicitly wants a
+    // visible, interactive update from a terminal.
+    let updater = if verbose { updater } else { silence(updater)? };
+    let updater = restart(updater)?;
+
+    let status = updater.update()?;
+    tracing::info!(?status, "self-update completed");
+    Ok(())
+}
+
+/// Build the GitHub update backend.
+///
+/// When `verbose` is false the backend is configured to run silently and
+/// without prompting; when true it prints progress and prompts for
+/// confirmation.
+fn backend(verbose: bool) -> Result<Box<dyn ReleaseUpdate>> {
+    // Load the verifying key from the compiled-in public key file
+    let key_bytes = include_bytes!("../keys/ed25519.pub");
+    if key_bytes.len() != 32 {
+        return Err(Error::Config(
+            "ed25519.pub must contain exactly 32 bytes".to_owned(),
+        ));
+    }
+    let verifying_key = [*key_bytes];
+
+    Update::configure()
+        .repo_owner("hyper-mcp-rs")
+        .repo_name("hyper-mcp-remote")
+        .bin_name("hyper-mcp-remote")
+        .identifier(&archive_identifier())
+        .current_version(cargo_crate_version!())
+        .verifying_keys(verifying_key)
+        .no_confirm(!verbose)
+        .show_output(verbose)
+        .build()
+}
+
+/// Wrap `inner` in the throttle limiter that bounds how often the update check
+/// contacts GitHub.
+fn throttle(inner: Box<dyn ReleaseUpdate>) -> Result<Box<dyn ReleaseUpdate>> {
+    self_update_extras::throttle::Update::configure()
+        .release_update(inner)
         .throttle_window(Duration::from_secs(15 * 60)) // 15-minute window
         .build()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(%e, "failed to build throttle wrapper");
-            return;
-        }
-    };
+}
 
-    let silenced = match self_update_extras::silence::Update::configure()
-        .release_update(throttled)
+/// Wrap `inner` in the silence wrapper that diverts fd 1 to `/dev/null` while
+/// the update runs, so `self_update`'s output can't corrupt the stdio MCP
+/// protocol stream.
+fn silence(inner: Box<dyn ReleaseUpdate>) -> Result<Box<dyn ReleaseUpdate>> {
+    self_update_extras::silence::Update::configure()
+        .release_update(inner)
         .sink(self_update_extras::silence::Sink::Null)
         .build()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(%e, "failed to build silence wrapper");
-            return;
-        }
-    };
+}
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        // On POSIX systems, wrap in restart::Update to re-execute after update
-        match self_update_extras::restart::Update::configure()
-            .release_update(silenced)
-            .guard_env("HYPER_MCP_REMOTE_AUTO_UPDATED")
-            .build()
-        {
-            Ok(updater) => match updater.update() {
-                Ok(status) => tracing::info!(?status, "update completed successfully"),
-                Err(e) => tracing::error!(%e, "update failed"),
-            },
-            Err(e) => {
-                tracing::error!(%e, "failed to build restart wrapper");
-            }
-        }
-    }
+/// Wrap `inner` in the restart wrapper so the process re-executes into the
+/// freshly installed binary after a successful update.
+#[cfg(not(target_os = "windows"))]
+fn restart(inner: Box<dyn ReleaseUpdate>) -> Result<Box<dyn ReleaseUpdate>> {
+    self_update_extras::restart::Update::configure()
+        .release_update(inner)
+        .guard_env("HYPER_MCP_REMOTE_AUTO_UPDATED")
+        .build()
+}
 
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, we cannot replace a running .exe
-        tracing::warn!(
-            "self-update on Windows is not supported. Please update manually or rebuild."
-        );
-        match silenced.update() {
-            Ok(status) => tracing::info!(?status, "update completed (no restart on Windows)"),
-            Err(e) => tracing::error!(%e, "update failed"),
-        }
-    }
+/// On Windows a running `.exe` cannot be replaced in place, so no restart is
+/// attempted; the new binary takes effect on the next launch. `inner` is
+/// returned unchanged.
+#[cfg(target_os = "windows")]
+fn restart(inner: Box<dyn ReleaseUpdate>) -> Result<Box<dyn ReleaseUpdate>> {
+    tracing::warn!("self-update on Windows cannot restart; new binary applies on next launch");
+    Ok(inner)
 }
 
 #[cfg(test)]

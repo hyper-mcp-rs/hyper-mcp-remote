@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 
     // Check for --update flag immediately after parsing.
     if cli.update {
-        update::update();
+        update::update(cli.verbose);
     }
 
     cli.validate().context("invalid CLI arguments")?;
