@@ -96,6 +96,49 @@ Each tarball/zip contains a single static `hyper-mcp-remote` binary; drop it
 anywhere on your `PATH`. A matching `checksums-<target>.txt` (SHA-256) and a
 CycloneDX `sbom.cdx.json` are uploaded alongside each release.
 
+Every `.tar.gz` and `.zip` release asset is signed with
+[`zipsign`](https://github.com/Kijewski/zipsign) using an ed25519 key. The
+signature is embedded transparently in the archive itself, so the file remains
+a valid `.tar.gz`/`.zip` and the published `checksums-<target>.txt` covers the
+signed artifact. See [Verifying downloads](#verifying-downloads) below.
+
+### Verifying downloads
+
+The ed25519 **public (verifying) key** lives in this repository at
+[`keys/ed25519.pub`](keys/ed25519.pub). It is a raw 32-byte key file — the
+format `zipsign` expects — not an armored/PEM key.
+
+To verify a downloaded archive, install `zipsign`, fetch the public key, and
+run the matching subcommand:
+
+```sh
+# 1. Install the verifier
+cargo install zipsign --locked
+
+# 2. Fetch the public key
+curl -fsSLO https://raw.githubusercontent.com/hyper-mcp-rs/hyper-mcp-remote/main/keys/ed25519.pub
+
+# 3a. Verify a .tar.gz (Linux/macOS assets)
+zipsign verify tar hyper-mcp-remote-x86_64-unknown-linux-gnu.tar.gz ed25519.pub
+
+# 3b. Verify a .zip (Windows asset)
+zipsign verify zip hyper-mcp-remote-x86_64-pc-windows-msvc.zip ed25519.pub
+```
+
+A successful check prints `OK` and exits `0`; any tampering or a wrong key
+exits non-zero.
+
+> **Note:** `zipsign` salts the signature with a *context* string that defaults
+> to the archive's file name. Keep the asset's original name when verifying. If
+> you renamed it, pass the original name explicitly with
+> `-c hyper-mcp-remote-<target>.tar.gz`.
+
+You can still cross-check the SHA-256 sum independently:
+
+```sh
+sha256sum -c checksums-x86_64-unknown-linux-gnu.txt
+```
+
 ### From crates.io
 
 ```sh

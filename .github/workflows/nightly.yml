@@ -243,6 +243,9 @@ jobs:
       - name: Install cargo-auditable
         run: cargo install cargo-auditable
 
+      - name: Install zipsign
+        run: cargo install zipsign --locked
+
       - name: Install compilation target
         shell: bash
         run: rustup target add "${TARGET}"
@@ -274,6 +277,22 @@ jobs:
             pkg="dist/hyper-mcp-remote-${TARGET}.tar.gz"
           fi
 
+          # Sign the archive in place with zipsign (ed25519). The private key is
+          # provided base64-encoded via the ED25519_PRIVATE_KEY secret; decode it
+          # to the binary key file zipsign expects. Signing happens before the
+          # checksum is computed so the checksum covers the signed artifact.
+          if [[ -z "${ED25519_PRIVATE_KEY_B64:-}" ]]; then
+            echo "ED25519_PRIVATE_KEY secret is not set" >&2
+            exit 1
+          fi
+          trap 'rm -f zipsign-priv.key' EXIT
+          printf '%s' "${ED25519_PRIVATE_KEY_B64}" | openssl base64 -d -A > zipsign-priv.key
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            zipsign sign zip "${pkg}" zipsign-priv.key
+          else
+            zipsign sign tar "${pkg}" zipsign-priv.key
+          fi
+
           # checksums
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "${pkg}" > "dist/checksums-${TARGET}.txt"
@@ -290,6 +309,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
           RUNNER_OS: ${{ runner.os }}
+          ED25519_PRIVATE_KEY_B64: ${{ secrets.ED25519_PRIVATE_KEY }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
