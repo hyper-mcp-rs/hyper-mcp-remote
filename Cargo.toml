@@ -59,7 +59,17 @@ rmcp = { version = "2.1", features = [
 # Self-update support: checks GitHub releases, downloads, replaces binary.
 # Feature "signatures" enables .verifying_keys() for ed25519ph signature verification.
 # Feature "rustls" for pure-Rust TLS (no OpenSSL dependency).
-self_update = { version = "0.44", features = ["signatures", "rustls"] }
+# Archive/compression features are required to extract the release assets:
+#   - compression-flate2 handles the .tar.gz assets (Linux/macOS); it pulls in archive-tar
+#   - compression-zip-deflate handles the .zip asset (Windows); it pulls in archive-zip
+# With "signatures", enabling archive-tar/archive-zip also turns on zipsign's
+# verify-tar/verify-zip, so downloaded archives are signature-verified.
+self_update = { version = "0.44", features = [
+    "signatures",
+    "rustls",
+    "compression-flate2",
+    "compression-zip-deflate",
+] }
 # Throttle + restart + silence wrappers: limits check frequency, re-executes
 # after update, and diverts stdout so it can't corrupt the stdio MCP stream.
 self-update-extras = "0.2"
