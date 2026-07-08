@@ -25,7 +25,13 @@ all-features = true
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # quick-xml < 0.41 has two high-severity vulnerabilities (RUSTSEC-2026-0194,
+    # RUSTSEC-2026-0195) but we cannot upgrade without checking compatibility
+    # with all dependents (rmcp, reqwest, etc.).
+    { id = "RUSTSEC-2026-0194", reason = "Cannot upgrade quick-xml without checking all dependents" },
+    { id = "RUSTSEC-2026-0195", reason = "Cannot upgrade quick-xml without checking all dependents" },
+]
 
 # ─────────────────────────────────────────────────────────────────────────
 # Licenses - allowlist model. This list is intentionally conservative for
@@ -72,12 +78,25 @@ ignore = true
 # `multiple-versions = "warn"` because pinning the entire ecosystem to a
 # single version of every transitive dep is a fight you can't win. Bump
 # to "deny" only after consolidating duplicates.
+#
+# Duplicate crates are skipped here because the dependency graph requires
+# multiple versions (e.g. old ed25519-dalek vs new, sha2 0.10 vs 0.11).
+# These are transitive deps where we have no direct control.
 # ─────────────────────────────────────────────────────────────────────────
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 deny = []
-skip = []
+skip = [
+    # Transitive deps: ed25519-dalek ecosystem requires both old (0.10.x) and new (2.x)
+    "block-buffer",
+    "cpufeatures",
+    "crypto-common",
+    "digest",
+    "getrandom",
+    "sha2",
+    "thiserror",
+]
 skip-tree = []
 
 # ─────────────────────────────────────────────────────────────────────────
