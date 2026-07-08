@@ -21,6 +21,11 @@ use clap::Parser;
 )]
 pub struct Cli {
     /// URL of the remote MCP server (e.g. `https://example.com/mcp`).
+    ///
+    /// Required to run the proxy. It may be omitted only when `--update` is
+    /// passed on its own, in which case the binary performs the self-update
+    /// check and exits. An empty value is rejected by `validate()`.
+    #[arg(default_value = "")]
     pub server_url: String,
 
     /// Extra HTTP header to send on every request to the remote server.
@@ -111,12 +116,17 @@ pub struct Cli {
     #[arg(long = "deny-tool", value_name = "PATTERN")]
     pub deny_tools: Vec<String>,
 
-    /// Perform a self-update check and exit.
+    /// Check for a newer release and self-update.
     ///
     /// Checks the latest GitHub release for a newer version of
-    /// `hyper-mcp-remote`, downloads and replaces the binary if found
-    /// (with signature verification), then re-executes the binary.
-    /// On Windows, prints a warning and continues without restarting.
+    /// `hyper-mcp-remote` and, if one is found, downloads it, verifies its
+    /// ed25519ph signature, and replaces the running binary. On POSIX the
+    /// process then re-executes into the new binary; on Windows it logs a
+    /// warning and the new binary takes effect on the next launch.
+    ///
+    /// Run on its own (without <SERVER_URL>) to update and exit. If a
+    /// <SERVER_URL> is also given, the update check runs first and then the
+    /// proxy starts as usual.
     ///
     /// By default the update runs silently and without prompting, so it is
     /// safe when the process is a stdio MCP server (stdout carries the
@@ -140,6 +150,13 @@ impl Cli {
     /// Validate the parsed CLI arguments. Returns a human-readable error on
     /// misconfiguration.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.server_url.is_empty() {
+            anyhow::bail!(
+                "missing <SERVER_URL>: a remote MCP server URL is required (it may be \
+                 omitted only when running --update on its own)"
+            );
+        }
+
         let url = url::Url::parse(&self.server_url)
             .map_err(|e| anyhow::anyhow!("invalid --server-url: {e}"))?;
 
@@ -372,5 +389,30 @@ mod tests {
     fn verbose_flag_is_false_by_default() {
         let cli = cli_with(&["--update", "https://example.com/mcp"]);
         assert!(!cli.verbose, "--verbose must default to false");
+    }
+
+    #[test]
+    fn update_parses_without_server_url() {
+        // `--update` (optionally with `--verbose`) must parse stand-alone,
+        // leaving `server_url` empty so main can update and exit.
+        let cli = cli_with(&["--update", "--verbose"]);
+        assert!(cli.update);
+        assert!(cli.verbose);
+        assert!(
+            cli.server_url.is_empty(),
+            "server_url must default to empty when omitted"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_server_url() {
+        let cli = cli_with(&["--update"]);
+        let err = cli
+            .validate()
+            .expect_err("an empty server URL must be rejected");
+        assert!(
+            err.to_string().contains("SERVER_URL"),
+            "error should name the missing SERVER_URL, got: {err}"
+        );
     }
 }

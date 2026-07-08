@@ -40,9 +40,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Check for --update flag immediately after parsing.
+    // Check for --update flag immediately after parsing. When --update is
+    // passed without a server URL, this is a stand-alone update invocation:
+    // perform the update and exit before validation (there is nothing to
+    // proxy). If a server URL is also present, fall through and start the
+    // proxy after the update check.
     if cli.update {
         update::update(cli.verbose);
+        if cli.server_url.is_empty() {
+            return Ok(());
+        }
     }
 
     cli.validate().context("invalid CLI arguments")?;
