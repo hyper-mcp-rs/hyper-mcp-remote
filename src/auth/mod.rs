@@ -168,7 +168,8 @@ async fn try_cached_credentials(
     // Detect staleness BEFORE handing the token to rmcp.
     // `OAuthState::set_credentials` unconditionally overwrites
     // `token_received_at` with the current time when it persists the
-    // restored credentials (see rmcp 1.7 transport/auth.rs L2325), so
+    // restored credentials (see `set_credentials` in rmcp 2.2's
+    // transport/auth.rs), so
     // by the time we'd ask `get_access_token` it would compute
     // `elapsed = 0` and treat an actually-expired token as fresh.
     // We have to make the expiry call ourselves, using the genuine

@@ -639,7 +639,7 @@ fn build_proxied_client_info(mut local: InitializeRequestParams) -> ClientInfo {
     const PROXY_TAG: &str = concat!(" (via hyper-mcp-remote ", env!("CARGO_PKG_VERSION"), ")");
     local.client_info.name.push_str(PROXY_TAG);
     // `InitializeRequestParams` and `ClientInfo` are the same struct under
-    // a different alias in rmcp 1.7.
+    // a different alias in rmcp 2.2.
     local
 }
 

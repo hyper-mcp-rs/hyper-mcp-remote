@@ -30,7 +30,7 @@ hex = "0.4"
 http = "1.4"
 # Direct dep for the `TokenResponse` trait so we can inspect cached
 # `OAuthTokenResponse` values (expires_in) when deciding whether to refresh.
-# Version pinned to match rmcp 1.7's transitive selection in Cargo.lock.
+# Version pinned to match rmcp 2.2's transitive selection in Cargo.lock.
 oauth2 = { version = "5.0", default-features = false }
 # keyring 4.x is a rewrite layered over `keyring-core` with pluggable stores.
 # The `v1` feature restores the classic all-in-one `Entry` API and
@@ -47,7 +47,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "stream",
 ] }
-rmcp = { version = "2.1", features = [
+rmcp = { version = "2.2", features = [
     "server",
     "client",
     "transport-io",
@@ -91,7 +91,7 @@ axum = "0.8"
 # Pulls in `transport-child-process` so the integration test can drive the
 # compiled `hyper-mcp-remote` binary over its stdin/stdout. The feature is
 # additive: Cargo merges the dev-deps feature set with the bin's.
-rmcp = { version = "2.1", features = ["transport-child-process"] }
+rmcp = { version = "2.2", features = ["transport-child-process"] }
 
 [[bin]]
 name = "hyper-mcp-remote"
