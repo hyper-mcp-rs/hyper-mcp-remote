@@ -91,100 +91,142 @@ pub async fn acquire_auth_client(
         "remote requires OAuth"
     );
 
-    // 2. Construct OAuthState, install our credential store.
-    //
-    // We deliberately pass `None` here so that rmcp builds its own internal
-    // HTTP client for talking to the authorization server. rmcp's auth
-    // module depends on a different (older) major of `reqwest` than the
-    // streamable-http transport, and mixing the two would require
-    // hand-bridging incompatible client types.
-    let mut state = OAuthState::new(discovery.authorization_server.as_str(), None)
-        .await
-        .context("failed to initialize OAuth state machine")?;
-
-    install_credential_store(&mut state, store.clone()).await?;
-
-    // 3. Try cached credentials first.
-    if let Some(cached) = store
-        .as_ref()
-        .load_via_trait()
-        .await
-        .context("failed to load cached credentials")?
-        && let Some(token) = cached.token_response.clone()
-    {
-        // Detect staleness BEFORE handing the token to rmcp.
-        // `OAuthState::set_credentials` unconditionally overwrites
-        // `token_received_at` with the current time when it persists the
-        // restored credentials (see rmcp 1.7 transport/auth.rs L2325), so
-        // by the time we'd ask `get_access_token` it would compute
-        // `elapsed = 0` and treat an actually-expired token as fresh.
-        // We have to make the expiry call ourselves, using the genuine
-        // `token_received_at` we just loaded.
-        let stale = cached_access_token_is_stale(&cached);
-        tracing::info!(
-            stale_cached_token = stale,
-            token_received_at = ?cached.token_received_at,
-            "found cached OAuth credentials; using them"
-        );
-        state
-            .set_credentials(&cached.client_id, token)
-            .await
-            .context("failed to apply cached credentials")?;
-
-        // `set_credentials` just clobbered `token_received_at` on disk
-        // with the current time. That would lie to every future launch
-        // (this one observed the lie when investigating the GitLab cache
-        // failure: the genuine timestamp was overwritten on a previous
-        // run, making an expired access token look fresh forever). Write
-        // the original `StoredCredentials` back so the next launch sees
-        // the truth.
-        if let Err(e) = store.as_ref().save_via_trait(cached.clone()).await {
-            tracing::warn!(
-                error = %e,
-                "could not restore genuine token_received_at after set_credentials; \
-                 future launches may incorrectly treat an expired token as fresh"
-            );
+    // 2. Try cached credentials first. On a cache miss — or a cache whose
+    //    access AND refresh tokens are both dead — fall through to the
+    //    interactive flow instead of bailing: many MCP hosts never restart
+    //    a failed server process, so exiting here would strand the user
+    //    with a dead connection until they manually relaunched.
+    let state = match try_cached_credentials(&store, &discovery).await? {
+        Some(state) => state,
+        None => {
+            // 3. Full interactive flow on a fresh `OAuthState`. Fresh for
+            // two reasons: a state that has been through `set_credentials`
+            // is `Authorized`, and `start_authorization` requires
+            // `Unauthorized`; and starting over redoes dynamic client
+            // registration — when a refresh token is dead the server may
+            // well have pruned the client registration along with it, so
+            // the cached `client_id` can't be trusted either.
+            let mut state = new_oauth_state(&discovery, &store).await?;
+            run_interactive_flow(cli, &mut state, &discovery)
+                .await
+                .context("interactive OAuth flow failed")?;
+            state
         }
-
-        if stale {
-            // We're now in `Authorized` with the wrong `received_at`.
-            // Force a refresh so the cache (and the in-memory token rmcp
-            // will hand to the transport) reflect a genuinely-fresh
-            // access token. If the refresh fails because the refresh
-            // token itself is no good, wipe the cache so the next launch
-            // can run a clean interactive flow.
-            tracing::info!(
-                "cached access token is expired or within refresh buffer; refreshing now"
-            );
-            match state.refresh_token().await {
-                Ok(()) => tracing::info!("refresh succeeded; cached credentials are current"),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "could not refresh expired cached credentials; clearing cache"
-                    );
-                    let _ = store.clear_sync();
-                    anyhow::bail!(
-                        "cached OAuth credentials are expired and the refresh \
-                         token could not be exchanged ({e}). The credential \
-                         cache has been cleared; re-run hyper-mcp-remote to \
-                         start a fresh OAuth flow"
-                    );
-                }
-            }
-        }
-
-        return Ok(AuthOutcome::Authorized {
-            client: into_auth_client(state, http_client)?,
-        });
-    }
-
-    // 4. No usable cached creds: run the interactive flow.
-    run_interactive_flow(cli, &mut state, &discovery).await?;
+    };
 
     Ok(AuthOutcome::Authorized {
         client: into_auth_client(state, http_client)?,
     })
+}
+
+/// Construct an `Unauthorized` [`OAuthState`] wired to our credential store.
+///
+/// We deliberately pass `None` for the HTTP client so that rmcp builds its
+/// own internal client for talking to the authorization server. rmcp's auth
+/// module depends on a different (older) major of `reqwest` than the
+/// streamable-http transport, and mixing the two would require
+/// hand-bridging incompatible client types.
+async fn new_oauth_state(
+    discovery: &OAuthDiscovery,
+    store: &Arc<SecureCredentialStore>,
+) -> Result<OAuthState> {
+    let mut state = OAuthState::new(discovery.authorization_server.as_str(), None)
+        .await
+        .context("failed to initialize OAuth state machine")?;
+    install_credential_store(&mut state, store.clone()).await?;
+    Ok(state)
+}
+
+/// Attempt to build an `Authorized` [`OAuthState`] from cached credentials.
+///
+/// Returns:
+/// - `Ok(Some(state))` — cached credentials are usable (proactively
+///   refreshed first if the access token was stale).
+/// - `Ok(None)` — nothing usable is cached, or the cached tokens were
+///   expired and the refresh exchange failed. In the latter case the cache
+///   has been cleared so the caller can run a clean interactive flow.
+/// - `Err(_)` — infrastructure failure (credential store I/O, OAuth state
+///   machine construction).
+async fn try_cached_credentials(
+    store: &Arc<SecureCredentialStore>,
+    discovery: &OAuthDiscovery,
+) -> Result<Option<OAuthState>> {
+    let Some(cached) = store
+        .as_ref()
+        .load_via_trait()
+        .await
+        .context("failed to load cached credentials")?
+    else {
+        return Ok(None);
+    };
+    let Some(token) = cached.token_response.clone() else {
+        return Ok(None);
+    };
+
+    let mut state = new_oauth_state(discovery, store).await?;
+
+    // Detect staleness BEFORE handing the token to rmcp.
+    // `OAuthState::set_credentials` unconditionally overwrites
+    // `token_received_at` with the current time when it persists the
+    // restored credentials (see rmcp 1.7 transport/auth.rs L2325), so
+    // by the time we'd ask `get_access_token` it would compute
+    // `elapsed = 0` and treat an actually-expired token as fresh.
+    // We have to make the expiry call ourselves, using the genuine
+    // `token_received_at` we just loaded.
+    let stale = cached_access_token_is_stale(&cached);
+    tracing::info!(
+        stale_cached_token = stale,
+        token_received_at = ?cached.token_received_at,
+        "found cached OAuth credentials; using them"
+    );
+    state
+        .set_credentials(&cached.client_id, token)
+        .await
+        .context("failed to apply cached credentials")?;
+
+    // `set_credentials` just clobbered `token_received_at` on disk
+    // with the current time. That would lie to every future launch
+    // (this one observed the lie when investigating the GitLab cache
+    // failure: the genuine timestamp was overwritten on a previous
+    // run, making an expired access token look fresh forever). Write
+    // the original `StoredCredentials` back so the next launch sees
+    // the truth.
+    if let Err(e) = store.as_ref().save_via_trait(cached.clone()).await {
+        tracing::warn!(
+            error = %e,
+            "could not restore genuine token_received_at after set_credentials; \
+             future launches may incorrectly treat an expired token as fresh"
+        );
+    }
+
+    if stale {
+        // We're now in `Authorized` with the wrong `received_at`.
+        // Force a refresh so the cache (and the in-memory token rmcp
+        // will hand to the transport) reflect a genuinely-fresh
+        // access token. If the refresh fails because the refresh
+        // token itself is no good, wipe the cache and signal the
+        // caller to run a clean interactive flow in this same process.
+        tracing::info!("cached access token is expired or within refresh buffer; refreshing now");
+        match state.refresh_token().await {
+            Ok(()) => tracing::info!("refresh succeeded; cached credentials are current"),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not refresh expired cached credentials; clearing cache \
+                     and falling back to interactive re-authorization"
+                );
+                if let Err(clear_err) = store.clear_sync() {
+                    tracing::warn!(
+                        error = %clear_err,
+                        "failed to clear stale credential cache"
+                    );
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    Ok(Some(state))
 }
 
 /// Convenience method on the concrete `SecureCredentialStore` that mirrors
@@ -607,5 +649,205 @@ mod tests {
         // May be Some if a real keyring entry survived from another test, but
         // must not error in either case.
         let _ = loaded;
+    }
+
+    // -- try_cached_credentials -------------------------------------------
+
+    use axum::http::StatusCode;
+    use axum::routing::post;
+
+    /// Minimal OAuth authorization server: serves RFC 8414 metadata (which
+    /// rmcp's `set_credentials` fetches) and a token endpoint that either
+    /// grants refresh exchanges or rejects them with `invalid_grant`,
+    /// depending on `refresh_ok`.
+    async fn spawn_mock_auth_server(refresh_ok: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{addr}");
+
+        let metadata = serde_json::json!({
+            "issuer": base,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+        });
+        let token_reply = if refresh_ok {
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "access_token": "refreshed-access",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "refresh_token": "refreshed-refresh",
+                }),
+            )
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "refresh token revoked or expired",
+                }),
+            )
+        };
+
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let metadata = metadata.clone();
+                    async move { axum::Json(metadata) }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let (status, body) = token_reply.clone();
+                    async move { (status, axum::Json(body)) }
+                }),
+            );
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (base, handle)
+    }
+
+    fn mock_discovery(auth_server: &str) -> OAuthDiscovery {
+        OAuthDiscovery {
+            authorization_server: auth_server.to_string(),
+            scopes: vec![],
+            resource: "https://example.com/mcp".to_string(),
+        }
+    }
+
+    fn make_test_store(dir: &std::path::Path, salt: &str) -> Arc<SecureCredentialStore> {
+        let key = CredentialKey::new(&format!("https://example.com/{salt}"), None);
+        let store = SecureCredentialStore::with_data_dir(&key, dir).expect("with_data_dir");
+        // Clear any leftover keyring entry from previous runs so tests are
+        // deterministic on machines with a real keyring.
+        store.clear_sync().expect("clear_sync");
+        Arc::new(store)
+    }
+
+    #[tokio::test]
+    async fn try_cached_credentials_returns_none_on_empty_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "tcc-empty");
+        // Point at an unbound port: an empty cache must short-circuit
+        // before any network I/O happens.
+        let discovery = mock_discovery("http://127.0.0.1:1");
+
+        let out = try_cached_credentials(&store, &discovery)
+            .await
+            .expect("empty cache is not an error");
+        assert!(
+            out.is_none(),
+            "empty cache must signal interactive fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_cached_credentials_accepts_fresh_cache_and_preserves_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "tcc-fresh");
+        // refresh_ok = false: if the fresh-token path ever hit the token
+        // endpoint, the mock would reject it and the assertions would fail.
+        let (auth_url, _h) = spawn_mock_auth_server(false).await;
+
+        let received_at = now_epoch_secs() - 60;
+        store
+            .save_via_trait(sample_stored(Some(received_at), Some(3600)))
+            .await
+            .expect("save");
+
+        let out = try_cached_credentials(&store, &mock_discovery(&auth_url))
+            .await
+            .expect("fresh cache must not error");
+        let state = out.expect("fresh cached creds must be usable without refresh");
+        assert!(
+            state.into_authorization_manager().is_some(),
+            "returned state must be Authorized"
+        );
+
+        let stored = store
+            .load_via_trait()
+            .await
+            .expect("load")
+            .expect("creds must still be cached");
+        assert_eq!(
+            stored.token_received_at,
+            Some(received_at),
+            "genuine token_received_at must survive set_credentials"
+        );
+        store.clear_sync().expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn try_cached_credentials_refreshes_stale_cache() {
+        use oauth2::TokenResponse;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "tcc-stale-refresh");
+        let (auth_url, _h) = spawn_mock_auth_server(true).await;
+
+        // Received 2h ago with a 1h lifetime: expired, must trigger refresh.
+        store
+            .save_via_trait(sample_stored(Some(now_epoch_secs() - 7200), Some(3600)))
+            .await
+            .expect("save");
+
+        let out = try_cached_credentials(&store, &mock_discovery(&auth_url))
+            .await
+            .expect("refreshable stale cache must not error");
+        let state = out.expect("stale-but-refreshable creds must be usable");
+        assert!(
+            state.into_authorization_manager().is_some(),
+            "returned state must be Authorized"
+        );
+
+        let stored = store
+            .load_via_trait()
+            .await
+            .expect("load")
+            .expect("refreshed creds must be cached");
+        let token = stored.token_response.expect("token_response present");
+        assert_eq!(
+            token.access_token().secret(),
+            "refreshed-access",
+            "cache must hold the refreshed access token"
+        );
+        assert!(
+            stored.token_received_at.unwrap_or(0) >= now_epoch_secs() - 60,
+            "token_received_at must reflect the fresh exchange"
+        );
+        store.clear_sync().expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn try_cached_credentials_falls_back_and_clears_cache_when_refresh_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "tcc-dead-refresh");
+        let (auth_url, _h) = spawn_mock_auth_server(false).await;
+
+        // Both tokens dead: access token expired, refresh exchange rejected.
+        store
+            .save_via_trait(sample_stored(Some(now_epoch_secs() - 7200), Some(3600)))
+            .await
+            .expect("save");
+
+        let out = try_cached_credentials(&store, &mock_discovery(&auth_url))
+            .await
+            .expect("a dead refresh token must NOT be fatal");
+        assert!(
+            out.is_none(),
+            "dead refresh token must signal interactive fallback"
+        );
+        assert!(
+            store.load_via_trait().await.expect("load").is_none(),
+            "cache must be cleared so the interactive flow starts clean"
+        );
     }
 }

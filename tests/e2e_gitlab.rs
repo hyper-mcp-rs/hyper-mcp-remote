@@ -33,6 +33,16 @@
 //!
 //! `--nocapture` is important because the proxy prints the authorization
 //! URL to its own stderr; without `--nocapture` you won't see it.
+//!
+//! ## Manually validating dead-token recovery
+//!
+//! The unit tests in `src/auth/mod.rs` cover the "access token expired AND
+//! refresh token rejected" fallback against a mock auth server. To validate
+//! it against real GitLab: revoke this app's authorization in GitLab
+//! (User Settings → Applications → Authorized applications) while cached
+//! credentials still exist, then re-run this test. The proxy must log the
+//! failed refresh, clear the cache, and reopen the browser for a full
+//! re-authorization — it must NOT exit with an error.
 
 #![deny(clippy::unwrap_used)]
 
