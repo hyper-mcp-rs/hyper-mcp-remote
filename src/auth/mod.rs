@@ -819,6 +819,12 @@ mod tests {
             "refreshed-access",
             "cache must hold the refreshed access token"
         );
+        assert_eq!(
+            token.refresh_token().map(|t| t.secret().as_str()),
+            Some("refreshed-refresh"),
+            "a rotated refresh token in the response must be persisted, \
+             not the old one"
+        );
         assert!(
             stored.token_received_at.unwrap_or(0) >= now_epoch_secs() - 60,
             "token_received_at must reflect the fresh exchange"
