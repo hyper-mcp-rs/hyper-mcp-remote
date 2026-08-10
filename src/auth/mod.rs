@@ -126,11 +126,20 @@ pub async fn acquire_auth_client(
 /// module depends on a different (older) major of `reqwest` than the
 /// streamable-http transport, and mixing the two would require
 /// hand-bridging incompatible client types.
+///
+/// `base_url` must be the *resource* URL (the MCP server itself), not the
+/// authorization server issuer: rmcp's `AuthorizationManager` uses it both
+/// to validate Protected Resource Metadata (SEP-985) against the resource
+/// server it re-fetches PRM from, and as the RFC 8707 `resource` parameter
+/// on authorize/token/refresh requests. Passing the authorization server
+/// URL here makes rmcp's own PRM re-fetch mismatch against the `resource`
+/// field servers correctly advertise (e.g. mcp.cloudflare.com), and sends
+/// the wrong audience in the `resource` parameter.
 async fn new_oauth_state(
     discovery: &OAuthDiscovery,
     store: &Arc<SecureCredentialStore>,
 ) -> Result<OAuthState> {
-    let mut state = OAuthState::new(discovery.authorization_server.as_str(), None)
+    let mut state = OAuthState::new(discovery.resource.as_str(), None)
         .await
         .context("failed to initialize OAuth state machine")?;
     install_credential_store(&mut state, store.clone()).await?;
@@ -352,7 +361,7 @@ async fn run_interactive_flow(
         .context("OAuth callback wait failed")?;
 
     state
-        .handle_callback(&code.code, &code.state)
+        .handle_callback_with_issuer(&code.code, &code.state, code.iss.as_deref())
         .await
         .context("OAuth code exchange failed")?;
 
@@ -720,8 +729,129 @@ mod tests {
         OAuthDiscovery {
             authorization_server: auth_server.to_string(),
             scopes: vec![],
-            resource: "https://example.com/mcp".to_string(),
+            // `resource` is now what `new_oauth_state` actually uses as the
+            // `base_url` handed to rmcp (see the fix this test file guards
+            // against a regression of): rmcp re-runs metadata discovery
+            // from it on every `set_credentials`/refresh, so it must point
+            // at our mock server too, or these tests would silently make
+            // real network calls to whatever fake host was here instead.
+            resource: auth_server.to_string(),
         }
+    }
+
+    /// Serves Protected Resource Metadata and RFC 8414/7591 endpoints all on
+    /// one origin, with the resource living at a sub-path (`/mcp`) and the
+    /// authorization server at the origin root — the same shape as
+    /// `mcp.cloudflare.com`. `resource` in the PRM document is deliberately
+    /// the full `{base}/mcp` URL, distinct from `authorization_servers`
+    /// (just `{base}`), so a test driving `OAuthState` with the wrong one as
+    /// `base_url` fails the SEP-985 resource-mismatch check.
+    async fn spawn_cloudflare_shaped_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{addr}");
+
+        let prm = serde_json::json!({
+            "resource": format!("{base}/mcp"),
+            "authorization_servers": [base],
+            "bearer_methods_supported": ["header"],
+        });
+        let as_metadata = serde_json::json!({
+            "issuer": base,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "registration_endpoint": format!("{base}/register"),
+            "authorization_response_iss_parameter_supported": true,
+        });
+
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get({
+                    let prm = prm.clone();
+                    move || {
+                        let prm = prm.clone();
+                        async move { axum::Json(prm) }
+                    }
+                }),
+            )
+            .route(
+                // Real Cloudflare serves the identical PRM document (with
+                // `resource: "{base}/mcp"`) at the bare root well-known path
+                // too, not just the `/mcp`-suffixed one. That's what makes
+                // the old bug bite: even with `base_url` wrongly set to the
+                // authorization-server root, rmcp's PRM re-fetch still finds
+                // a real (mismatching) document here instead of 404ing and
+                // falling back to the legacy RFC 8414 discovery path.
+                "/.well-known/oauth-protected-resource",
+                get(move || {
+                    let prm = prm.clone();
+                    async move { axum::Json(prm) }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let as_metadata = as_metadata.clone();
+                    async move { axum::Json(as_metadata) }
+                }),
+            )
+            .route(
+                "/register",
+                post(|body: String| async move {
+                    let req: serde_json::Value =
+                        serde_json::from_str(&body).expect("valid registration request JSON");
+                    axum::Json(serde_json::json!({
+                        "client_id": "test-client-id",
+                        "redirect_uris": req["redirect_uris"],
+                    }))
+                }),
+            );
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (base, handle)
+    }
+
+    /// Regression test for the resource/base_url bug: `new_oauth_state` must
+    /// hand rmcp the resource URL (`discovery.resource`), not the
+    /// authorization server issuer (`discovery.authorization_server`), as
+    /// `base_url`. With the old code this failed before a browser was ever
+    /// opened, with "Protected resource metadata resource mismatch: expected
+    /// '<authorization_server>', got '<resource>'" — because rmcp's
+    /// `discover_metadata()` re-fetches PRM from `base_url` and requires it
+    /// to equal the `resource` field the server reports.
+    #[tokio::test]
+    async fn start_authorization_succeeds_when_resource_and_authorization_server_share_origin() {
+        let (base, _handle) = spawn_cloudflare_shaped_server().await;
+        let discovery = OAuthDiscovery {
+            authorization_server: base.clone(),
+            scopes: vec![],
+            resource: format!("{base}/mcp"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            SecureCredentialStore::with_data_dir(
+                &CredentialKey::new(&discovery.resource, None),
+                dir.path(),
+            )
+            .expect("with_data_dir"),
+        );
+
+        let mut state = new_oauth_state(&discovery, &store)
+            .await
+            .expect("OAuthState must initialize");
+        state
+            .start_authorization(&[], "http://127.0.0.1:0/oauth/callback", Some("test-client"))
+            .await
+            .expect(
+                "start_authorization must succeed: PRM's `resource` field matches \
+                 discovery.resource used as base_url, not discovery.authorization_server",
+            );
     }
 
     fn make_test_store(dir: &std::path::Path, salt: &str) -> Arc<SecureCredentialStore> {

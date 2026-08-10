@@ -33,20 +33,20 @@ pub enum AuthRequirement {
 /// Information needed to start the OAuth flow against this server.
 #[derive(Debug, Clone)]
 pub struct OAuthDiscovery {
-    /// Issuer URL of the authorization server. Used as the base URL for
-    /// `OAuthState::new` and for RFC 8414 metadata discovery.
+    /// Issuer URL of the authorization server, as advertised by the
+    /// resource's Protected Resource Metadata (or the resource URL itself,
+    /// as a fallback — see the comment above). Currently used only for
+    /// logging/diagnostics.
     pub authorization_server: String,
     /// Scopes the resource server expects, in priority order:
     /// header scope > PRM scopes_supported. Empty if neither was given.
     pub scopes: Vec<String>,
-    /// The OAuth `resource` parameter (RFC 8707) that the auth server should
-    /// embed in the access token. Defaults to the MCP server URL.
-    //
-    // Currently informational only — rmcp's `AuthorizationManager` already
-    // attaches a `resource` parameter automatically from the `base_url` it
-    // was constructed with. Kept on the struct so logging/diagnostics can
-    // surface it.
-    #[allow(dead_code)]
+    /// The MCP resource server's own URL. Defaults to the MCP server URL
+    /// passed on the command line. Used as the `base_url` for
+    /// `OAuthState::new`: rmcp's `AuthorizationManager` treats `base_url` as
+    /// the resource server, both for validating Protected Resource Metadata
+    /// (SEP-985) and as the RFC 8707 `resource` parameter it attaches to
+    /// authorize/token/refresh requests.
     pub resource: String,
 }
 
