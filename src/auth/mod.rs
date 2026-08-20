@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use http::{HeaderName, HeaderValue};
 use reqwest::Client as HttpClient;
-use rmcp::transport::auth::{AuthClient, OAuthState};
+use rmcp::transport::auth::{AuthClient, AuthorizationManager, OAuthClientConfig, OAuthState};
 
 use crate::cli::Cli;
 use crate::session::CredentialKey;
@@ -98,8 +98,18 @@ pub async fn acquire_auth_client(
     //    with a dead connection until they manually relaunched.
     let state = match try_cached_credentials(&store, &discovery).await? {
         Some(state) => state,
+        None if cli.client_id.is_some() => {
+            // 3a. Pre-registered client: skip RFC 7591 dynamic client
+            // registration entirely. Required for IdPs without DCR
+            // support (e.g. Microsoft Entra ID).
+            let raw = cli.client_id.as_deref().unwrap_or_default();
+            let client_id = resolve_client_id(raw, &http_client).await?;
+            run_preregistered_flow(cli, &discovery, &store, &client_id)
+                .await
+                .context("interactive OAuth flow (pre-registered client) failed")?
+        }
         None => {
-            // 3. Full interactive flow on a fresh `OAuthState`. Fresh for
+            // 3b. Full interactive flow on a fresh `OAuthState`. Fresh for
             // two reasons: a state that has been through `set_credentials`
             // is `Authorized`, and `start_authorization` requires
             // `Unauthorized`; and starting over redoes dynamic client
@@ -336,20 +346,7 @@ async fn run_interactive_flow(
         .await
         .context("failed to build authorization URL")?;
 
-    // Print to stderr so the MCP host (which owns stdout) can surface it.
-    tracing::warn!("\nOpen this URL in your browser to authorize hyper-mcp-remote:\n{auth_url}\n");
-    match webbrowser::open(&auth_url) {
-        Ok(_) => tracing::info!("opened authorization URL in default browser"),
-        Err(e) => {
-            tracing::warn!(error = %e, "couldn't open browser automatically; please open the URL above manually")
-        }
-    }
-
-    let timeout = Duration::from_secs(cli.auth_timeout_secs);
-    let code = callback
-        .wait(timeout)
-        .await
-        .context("OAuth callback wait failed")?;
+    let code = authorize_in_browser(cli, &auth_url, callback).await?;
 
     state
         .handle_callback(&code.code, &code.state)
@@ -358,6 +355,138 @@ async fn run_interactive_flow(
 
     tracing::info!("OAuth authorization complete");
     Ok(())
+}
+
+/// Resolve a `--client-id` value to a concrete client ID.
+///
+/// A plain string is returned as-is. An `http(s)://` value is treated as a
+/// Client ID Metadata Document URL: the document is fetched and its
+/// `client_id` field is extracted.
+async fn resolve_client_id(raw: &str, http: &HttpClient) -> Result<String> {
+    if !raw.starts_with("https://") && !raw.starts_with("http://") {
+        return Ok(raw.to_string());
+    }
+
+    tracing::info!(url = %raw, "fetching client ID metadata document");
+    let resp = http
+        .get(raw)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch client ID metadata document from {raw}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "client ID metadata document fetch returned {} for {raw}",
+        resp.status()
+    );
+    let doc: serde_json::Value = resp
+        .json()
+        .await
+        .context("client ID metadata document is not valid JSON")?;
+    let client_id = doc
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .context("client ID metadata document has no string `client_id` field")?;
+    Ok(client_id.to_string())
+}
+
+/// Build an `AuthorizationManager` configured with a pre-registered
+/// `client_id`, ready to produce an authorization URL — no RFC 7591
+/// dynamic registration is performed.
+///
+/// This drops below the `OAuthState` convenience wrapper because its
+/// `start_authorization` path unconditionally registers; rmcp's docs
+/// explicitly support driving `AuthorizationManager` directly.
+async fn prepare_preregistered_manager(
+    discovery: &OAuthDiscovery,
+    store: &Arc<SecureCredentialStore>,
+    client_id: &str,
+    scopes: &[String],
+    redirect_uri: &str,
+) -> Result<AuthorizationManager> {
+    let mut manager = AuthorizationManager::new(discovery.authorization_server.as_str())
+        .await
+        .context("failed to initialize OAuth authorization manager")?;
+    manager.set_credential_store(ArcStore(store.clone()));
+
+    let metadata = manager
+        .discover_metadata()
+        .await
+        .context("failed to discover authorization server metadata (RFC 8414)")?;
+    manager.set_metadata(metadata);
+
+    manager
+        .configure_client(
+            OAuthClientConfig::new(client_id, redirect_uri).with_scopes(scopes.to_vec()),
+        )
+        .context("failed to configure pre-registered OAuth client")?;
+
+    Ok(manager)
+}
+
+/// Interactive OAuth flow for a pre-registered client: authorize + PKCE +
+/// token exchange, skipping dynamic client registration. Returns an
+/// `Authorized` state on success.
+async fn run_preregistered_flow(
+    cli: &Cli,
+    discovery: &OAuthDiscovery,
+    store: &Arc<SecureCredentialStore>,
+    client_id: &str,
+) -> Result<OAuthState> {
+    let callback = CallbackServer::bind(&cli.callback_host, cli.callback_port.unwrap_or(0))
+        .await
+        .context("failed to start local OAuth callback server")?;
+
+    let scopes = effective_scopes(cli, discovery);
+    tracing::info!(
+        client_id = %client_id,
+        scopes = ?scopes,
+        "starting OAuth authorization with pre-registered client (skipping DCR)"
+    );
+
+    let manager =
+        prepare_preregistered_manager(discovery, store, client_id, &scopes, &callback.redirect_uri)
+            .await?;
+
+    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let auth_url = manager
+        .get_authorization_url(&scope_refs)
+        .await
+        .context("failed to build authorization URL")?;
+
+    let code = authorize_in_browser(cli, &auth_url, callback).await?;
+
+    // Persists the token set (with `token_received_at`) through our
+    // credential store, same as the DCR path.
+    manager
+        .exchange_code_for_token(&code.code, &code.state)
+        .await
+        .context("OAuth code exchange failed")?;
+
+    tracing::info!("OAuth authorization complete (pre-registered client)");
+    Ok(OAuthState::Authorized(manager))
+}
+
+/// Open `auth_url` in the user's browser (with a stderr fallback prompt)
+/// and wait for the loopback callback to deliver the authorization code.
+async fn authorize_in_browser(
+    cli: &Cli,
+    auth_url: &str,
+    callback: CallbackServer,
+) -> Result<callback::AuthCode> {
+    // Print to stderr so the MCP host (which owns stdout) can surface it.
+    tracing::warn!("\nOpen this URL in your browser to authorize hyper-mcp-remote:\n{auth_url}\n");
+    match webbrowser::open(auth_url) {
+        Ok(_) => tracing::info!("opened authorization URL in default browser"),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't open browser automatically; please open the URL above manually")
+        }
+    }
+
+    let timeout = Duration::from_secs(cli.auth_timeout_secs);
+    callback
+        .wait(timeout)
+        .await
+        .context("OAuth callback wait failed")
 }
 
 /// Determine the final scope list, with CLI override taking precedence over
@@ -855,6 +984,133 @@ mod tests {
         assert!(
             store.load_via_trait().await.expect("load").is_none(),
             "cache must be cleared so the interactive flow starts clean"
+        );
+    }
+
+    // -- resolve_client_id ------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_client_id_passes_plain_id_through_without_network() {
+        let http = build_http_client().expect("http client");
+        let id = resolve_client_id("11111111-2222-3333-4444-555555555555", &http)
+            .await
+            .expect("plain ID must resolve");
+        assert_eq!(id, "11111111-2222-3333-4444-555555555555");
+    }
+
+    async fn spawn_cimd_server(body: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let app = Router::new().route(
+            "/client-metadata.json",
+            get(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (format!("http://{addr}/client-metadata.json"), handle)
+    }
+
+    #[tokio::test]
+    async fn resolve_client_id_fetches_cimd_url_and_extracts_client_id() {
+        let (url, _h) = spawn_cimd_server(serde_json::json!({
+            "client_id": "entra-app-guid",
+            "client_name": "hyper-mcp-remote",
+            "redirect_uris": ["http://127.0.0.1:9099/oauth/callback"],
+        }))
+        .await;
+        let http = build_http_client().expect("http client");
+        let id = resolve_client_id(&url, &http).await.expect("CIMD resolve");
+        assert_eq!(id, "entra-app-guid");
+    }
+
+    #[tokio::test]
+    async fn resolve_client_id_errors_when_cimd_lacks_client_id() {
+        let (url, _h) = spawn_cimd_server(serde_json::json!({
+            "client_name": "no id here",
+        }))
+        .await;
+        let http = build_http_client().expect("http client");
+        let err = resolve_client_id(&url, &http)
+            .await
+            .expect_err("missing client_id field must error");
+        assert!(
+            err.to_string().contains("client_id"),
+            "error must name the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_client_id_errors_on_http_failure() {
+        // Nothing listening on this URL: fetch must fail, not silently
+        // fall back to treating the URL string as a client ID.
+        let http = build_http_client().expect("http client");
+        let err = resolve_client_id("http://127.0.0.1:1/client-metadata.json", &http)
+            .await
+            .expect_err("unreachable CIMD URL must error");
+        assert!(
+            err.to_string().contains("client ID metadata document"),
+            "error must explain what failed, got: {err}"
+        );
+    }
+
+    // -- prepare_preregistered_manager -------------------------------------
+
+    #[tokio::test]
+    async fn preregistered_manager_builds_pkce_auth_url_without_dcr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "prereg");
+        // The mock advertises no registration_endpoint, so any attempt at
+        // dynamic registration would fail loudly.
+        let (auth_url_base, _h) = spawn_mock_auth_server(false).await;
+        let discovery = mock_discovery(&auth_url_base);
+
+        let scopes = vec!["read".to_string(), "write".to_string()];
+        let redirect_uri = "http://127.0.0.1:9099/oauth/callback";
+        let manager = prepare_preregistered_manager(
+            &discovery,
+            &store,
+            "entra-app-guid",
+            &scopes,
+            redirect_uri,
+        )
+        .await
+        .expect("pre-registered manager must configure without DCR");
+
+        let url = manager
+            .get_authorization_url(&["read", "write"])
+            .await
+            .expect("authorization URL");
+        let parsed = url::Url::parse(&url).expect("valid URL");
+        let params: std::collections::HashMap<String, String> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("entra-app-guid"),
+            "authorize URL must carry the pre-registered client ID"
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some(redirect_uri),
+            "authorize URL must use our loopback redirect, not the AS base URL"
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256"),
+            "PKCE must still be in force for pre-registered clients"
+        );
+        assert!(
+            params.contains_key("code_challenge"),
+            "authorize URL must carry a PKCE challenge"
         );
     }
 }

@@ -44,6 +44,20 @@ pub struct Cli {
     #[arg(long, default_value = "hyper-mcp-remote")]
     pub client_name: String,
 
+    /// Pre-registered OAuth client ID; skips RFC 7591 dynamic client
+    /// registration. Required for identity providers that do not support
+    /// DCR (e.g. Microsoft Entra ID).
+    ///
+    /// The value is either the client ID itself, or an `https://` URL to a
+    /// Client ID Metadata Document — the document is fetched and its
+    /// `client_id` field is used.
+    ///
+    /// Most IdPs that require pre-registration also require a pre-registered
+    /// redirect URI; pair this with `--callback-port` so the loopback
+    /// redirect is stable across runs.
+    #[arg(long, value_name = "ID_OR_URL")]
+    pub client_id: Option<String>,
+
     /// Comma-separated list of OAuth scopes to request, overriding any scopes
     /// discovered from server metadata.
     #[arg(long, value_name = "SCOPES")]
@@ -293,6 +307,7 @@ mod tests {
         assert!(cli.headers.is_empty());
         assert!(cli.resource.is_none());
         assert_eq!(cli.client_name, "hyper-mcp-remote");
+        assert!(cli.client_id.is_none());
         assert!(cli.scope.is_none());
         assert_eq!(cli.callback_host, "127.0.0.1");
         assert!(cli.callback_port.is_none());
@@ -331,6 +346,34 @@ mod tests {
         // string and that it's preserved.
         let cli = cli_with(&["--allow-tool", "a,b,c", "https://example.com/mcp"]);
         assert_eq!(cli.allow_tools, vec!["a,b,c"]);
+    }
+
+    #[test]
+    fn parses_client_id_as_plain_string() {
+        let cli = cli_with(&[
+            "--client-id",
+            "11111111-2222-3333-4444-555555555555",
+            "https://example.com/mcp",
+        ]);
+        assert_eq!(
+            cli.client_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        cli.validate().expect("--client-id must validate");
+    }
+
+    #[test]
+    fn parses_client_id_as_metadata_url() {
+        let cli = cli_with(&[
+            "--client-id",
+            "https://example.com/client-metadata.json",
+            "https://example.com/mcp",
+        ]);
+        assert_eq!(
+            cli.client_id.as_deref(),
+            Some("https://example.com/client-metadata.json"),
+            "URL values are stored verbatim; resolution happens in the auth module"
+        );
     }
 
     #[test]
