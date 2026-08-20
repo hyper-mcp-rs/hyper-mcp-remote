@@ -16,7 +16,6 @@ documentation = "https://github.com/hyper-mcp-rs/hyper-mcp-remote"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.22"
 clap = { version = "4.6", features = ["derive", "env"] }
 ctor = "1.0"
 directories = "6.0"
@@ -27,7 +26,7 @@ futures = "0.3"
 # new transitive surface of any consequence.
 globset = "0.4"
 hex = "0.4"
-http = "1.4"
+http = "1.5"
 # Direct dep for the `TokenResponse` trait so we can inspect cached
 # `OAuthTokenResponse` values (expires_in) when deciding whether to refresh.
 # Version pinned to match rmcp 2.2's transitive selection in Cargo.lock.
@@ -77,7 +76,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 thiserror = "2.0"
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-appender = "0.2"
