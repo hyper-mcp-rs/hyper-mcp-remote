@@ -72,7 +72,7 @@ pub async fn acquire_auth_client(
         &http_client,
         &cli.server_url,
         headers,
-        cli.resource.as_deref(),
+        cli.resource.as_ref(),
     )
     .await
     .context("failed to discover OAuth requirements")?;
@@ -405,6 +405,11 @@ async fn resolve_client_id(raw: &str, http: &HttpClient) -> Result<String> {
 /// This drops below the `OAuthState` convenience wrapper because its
 /// `start_authorization` path unconditionally registers; rmcp's docs
 /// explicitly support driving `AuthorizationManager` directly.
+///
+/// As with [`new_oauth_state`], the `base_url` handed to rmcp must be the
+/// *resource* URL, not the authorization server: rmcp validates Protected
+/// Resource Metadata against it and attaches it as the RFC 8707 `resource`
+/// parameter on authorize/token/refresh requests.
 async fn prepare_preregistered_manager(
     discovery: &OAuthDiscovery,
     store: &Arc<SecureCredentialStore>,
@@ -412,7 +417,7 @@ async fn prepare_preregistered_manager(
     scopes: &[String],
     redirect_uri: &str,
 ) -> Result<AuthorizationManager> {
-    let mut manager = AuthorizationManager::new(discovery.authorization_server.as_str())
+    let mut manager = AuthorizationManager::new(discovery.resource.as_str())
         .await
         .context("failed to initialize OAuth authorization manager")?;
     manager.set_credential_store(ArcStore(store.clone()));
@@ -465,9 +470,12 @@ async fn run_preregistered_flow(
     let code = authorize_in_browser(cli, &auth_url, callback).await?;
 
     // Persists the token set (with `token_received_at`) through our
-    // credential store, same as the DCR path.
+    // credential store, same as the DCR path. The RFC 9207 `iss` must be
+    // forwarded here too: servers advertising
+    // `authorization_response_iss_parameter_supported` hard-require it
+    // back at token-exchange time.
     manager
-        .exchange_code_for_token(&code.code, &code.state)
+        .exchange_code_for_token_with_issuer(&code.code, &code.state, code.iss.as_deref())
         .await
         .context("OAuth code exchange failed")?;
 
@@ -578,7 +586,7 @@ mod tests {
         OAuthDiscovery {
             authorization_server: "https://auth.example.com".to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
-            resource: "https://example.com/mcp".to_string(),
+            resource: url::Url::parse("https://example.com/mcp").expect("resource URL"),
         }
     }
 
@@ -864,7 +872,7 @@ mod tests {
             // from it on every `set_credentials`/refresh, so it must point
             // at our mock server too, or these tests would silently make
             // real network calls to whatever fake host was here instead.
-            resource: auth_server.to_string(),
+            resource: url::Url::parse(auth_server).expect("mock auth server URL must parse"),
         }
     }
 
@@ -960,12 +968,12 @@ mod tests {
         let discovery = OAuthDiscovery {
             authorization_server: base.clone(),
             scopes: vec![],
-            resource: format!("{base}/mcp"),
+            resource: url::Url::parse(&format!("{base}/mcp")).expect("resource URL must parse"),
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(
             SecureCredentialStore::with_data_dir(
-                &CredentialKey::new(&discovery.resource, None),
+                &CredentialKey::new(discovery.resource.as_str(), None),
                 dir.path(),
             )
             .expect("with_data_dir"),
@@ -1245,6 +1253,56 @@ mod tests {
         assert!(
             params.contains_key("code_challenge"),
             "authorize URL must carry a PKCE challenge"
+        );
+    }
+
+    /// Regression test for the pre-registered flow's variant of the
+    /// resource/base_url bug: `prepare_preregistered_manager` was added on
+    /// main (before the base_url fix landed) passing
+    /// `discovery.authorization_server` to `AuthorizationManager::new`, so
+    /// merging the two silently reintroduced the bug in the `--client-id`
+    /// path. Same Cloudflare-shaped mock as the DCR-path test: PRM's
+    /// `resource` is `{base}/mcp`, so rmcp's own PRM re-fetch mismatches
+    /// unless `base_url` is `discovery.resource`. Also asserts the RFC 8707
+    /// `resource` parameter carries the resource URL (the token audience),
+    /// not the AS URL.
+    #[tokio::test]
+    async fn preregistered_manager_succeeds_when_resource_and_authorization_server_share_origin() {
+        let (base, _handle) = spawn_cloudflare_shaped_server().await;
+        let discovery = OAuthDiscovery {
+            authorization_server: base.clone(),
+            scopes: vec![],
+            resource: url::Url::parse(&format!("{base}/mcp")).expect("resource URL must parse"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "prereg-cf");
+
+        let manager = prepare_preregistered_manager(
+            &discovery,
+            &store,
+            "pre-registered-id",
+            &["read".to_string()],
+            "http://127.0.0.1:9099/oauth/callback",
+        )
+        .await
+        .expect(
+            "pre-registered manager must initialize: base_url must be discovery.resource, \
+             not discovery.authorization_server, or rmcp's PRM re-fetch mismatches",
+        );
+
+        let url = manager
+            .get_authorization_url(&["read"])
+            .await
+            .expect("authorization URL");
+        let parsed = url::Url::parse(&url).expect("valid URL");
+        let resource_param = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "resource")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(
+            resource_param.as_deref(),
+            Some(format!("{base}/mcp").as_str()),
+            "RFC 8707 resource parameter must be the resource URL, not the AS URL"
         );
     }
 }

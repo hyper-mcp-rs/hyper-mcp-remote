@@ -35,10 +35,17 @@ pub struct Cli {
     #[arg(long = "header", value_name = "HEADER")]
     pub headers: Vec<String>,
 
-    /// OAuth resource identifier (RFC 8707), used to isolate sessions when
-    /// proxying multiple tenants of the same server.
+    /// OAuth resource identifier (RFC 8707): the MCP server's canonical URL,
+    /// sent to the authorization server as the token audience and used as the
+    /// base URL for OAuth discovery in place of <SERVER_URL>.
+    ///
+    /// Must be an absolute http(s) URL without a fragment, matching the
+    /// `resource` field the server advertises in its Protected Resource
+    /// Metadata (RFC 9728). Distinct values also isolate cached credentials,
+    /// e.g. when proxying multiple tenants of the same server via
+    /// tenant-specific resource URLs.
     #[arg(long, value_name = "URL")]
-    pub resource: Option<String>,
+    pub resource: Option<url::Url>,
 
     /// OAuth client name advertised during dynamic client registration.
     #[arg(long, default_value = "hyper-mcp-remote")]
@@ -173,7 +180,34 @@ impl Cli {
 
         let url = url::Url::parse(&self.server_url)
             .map_err(|e| anyhow::anyhow!("invalid --server-url: {e}"))?;
+        self.check_http_scheme(&url, "server URL")?;
 
+        if let Some(resource) = &self.resource {
+            // RFC 8707 §2: the resource indicator MUST NOT include a
+            // fragment component.
+            if resource.fragment().is_some() {
+                anyhow::bail!("--resource must not include a fragment (RFC 8707): '{resource}'");
+            }
+            // rmcp fetches Protected Resource Metadata from this URL and
+            // sends bearer-token requests derived from it, so it is subject
+            // to the same scheme rules as the server URL itself. (RFC 8707
+            // also permits abstract URIs such as URNs, but those can never
+            // work as an OAuth discovery base URL.)
+            self.check_http_scheme(resource, "--resource URL")?;
+        }
+
+        // A zero `ping_timeout_secs` while pings are enabled would degenerate
+        // to an instant timeout on every probe, so reject it up-front.
+        if self.ping_interval_secs != 0 && self.ping_timeout_secs == 0 {
+            anyhow::bail!("--ping-timeout-secs must be > 0 when keepalive pings are enabled");
+        }
+
+        Ok(())
+    }
+
+    /// Shared transport policy for any URL the proxy sends credentials to:
+    /// https always; http only for loopback hosts unless `--allow-http`.
+    fn check_http_scheme(&self, url: &url::Url, what: &str) -> anyhow::Result<()> {
         let is_loopback = matches!(
             url.host_str(),
             Some("localhost") | Some("127.0.0.1") | Some("::1")
@@ -181,19 +215,12 @@ impl Cli {
 
         if url.scheme() == "http" && !is_loopback && !self.allow_http {
             anyhow::bail!(
-                "refusing to use http:// for non-loopback URL '{}'; pass --allow-http to override",
-                self.server_url
+                "refusing to use http:// for non-loopback {what} '{url}'; pass --allow-http to override"
             );
         }
 
         if url.scheme() != "http" && url.scheme() != "https" {
-            anyhow::bail!("server URL must use http or https scheme");
-        }
-
-        // A zero `ping_timeout_secs` while pings are enabled would degenerate
-        // to an instant timeout on every probe, so reject it up-front.
-        if self.ping_interval_secs != 0 && self.ping_timeout_secs == 0 {
-            anyhow::bail!("--ping-timeout-secs must be > 0 when keepalive pings are enabled");
+            anyhow::bail!("{what} must use http or https scheme");
         }
 
         Ok(())
@@ -276,7 +303,7 @@ mod tests {
             "--header",
             "X-B: 2",
             "--resource",
-            "tenant-1",
+            "https://example.com/mcp/tenant-1",
             "--client-name",
             "my-client",
             "--scope",
@@ -291,7 +318,10 @@ mod tests {
             "https://example.com/mcp",
         ]);
         assert_eq!(cli.headers.len(), 2);
-        assert_eq!(cli.resource.as_deref(), Some("tenant-1"));
+        assert_eq!(
+            cli.resource.as_ref().map(url::Url::as_str),
+            Some("https://example.com/mcp/tenant-1")
+        );
         assert_eq!(cli.client_name, "my-client");
         assert_eq!(cli.scope.as_deref(), Some("read,write"));
         assert_eq!(cli.callback_host, "127.0.0.1");
@@ -299,6 +329,69 @@ mod tests {
         assert_eq!(cli.auth_timeout_secs, 42);
         assert!(cli.reset_auth);
         assert!(!cli.allow_http);
+    }
+
+    #[test]
+    fn resource_rejects_non_url_at_parse_time() {
+        // Before `--resource` became rmcp's OAuth base_url this value was
+        // accepted (and silently unused). Now it must parse as a URL, and
+        // the failure must surface as a clear clap error at startup rather
+        // than a cryptic OAuth state-machine failure at connect time.
+        let res = Cli::try_parse_from([
+            "hyper-mcp-remote",
+            "--resource",
+            "tenant-1",
+            "https://example.com/mcp",
+        ]);
+        assert!(res.is_err(), "bare label must be rejected at parse time");
+    }
+
+    #[test]
+    fn validate_rejects_resource_with_fragment() {
+        let cli = cli_with(&[
+            "--resource",
+            "https://example.com/mcp#frag",
+            "https://example.com/mcp",
+        ]);
+        let err = cli
+            .validate()
+            .expect_err("fragment in --resource must be rejected (RFC 8707)");
+        assert!(err.to_string().contains("fragment"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_http_resource_scheme() {
+        // RFC 8707 permits abstract URIs (e.g. URNs) — and `url::Url`
+        // happily parses them — but rmcp fetches metadata from this URL,
+        // so only http(s) can ever work here.
+        let cli = cli_with(&["--resource", "urn:example:cal", "https://example.com/mcp"]);
+        let err = cli.validate().expect_err("urn --resource must be rejected");
+        assert!(err.to_string().contains("http or https"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_loopback_http_resource_without_flag() {
+        let cli = cli_with(&[
+            "--resource",
+            "http://example.com/mcp",
+            "https://example.com/mcp",
+        ]);
+        let err = cli
+            .validate()
+            .expect_err("non-loopback http --resource must be rejected");
+        assert!(err.to_string().contains("--allow-http"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_http_resource_with_allow_flag() {
+        let cli = cli_with(&[
+            "--allow-http",
+            "--resource",
+            "http://example.com/mcp",
+            "https://example.com/mcp",
+        ]);
+        cli.validate()
+            .expect("--allow-http must apply to --resource too");
     }
 
     #[test]

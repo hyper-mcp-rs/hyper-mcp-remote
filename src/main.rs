@@ -55,8 +55,9 @@ async fn main() -> Result<()> {
     cli.validate().context("invalid CLI arguments")?;
 
     let headers = headers::parse(&cli.headers).context("failed to parse --header arguments")?;
-    let session = SessionHash::new(&cli.server_url, cli.resource.as_deref(), &headers);
-    let cred_key = CredentialKey::new(&cli.server_url, cli.resource.as_deref());
+    let resource = cli.resource.as_ref().map(url::Url::as_str);
+    let session = SessionHash::new(&cli.server_url, resource, &headers);
+    let cred_key = CredentialKey::new(&cli.server_url, resource);
 
     tracing::info!(
         server_url = %cli.server_url,

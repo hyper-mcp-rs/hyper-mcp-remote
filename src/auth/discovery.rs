@@ -42,12 +42,14 @@ pub struct OAuthDiscovery {
     /// header scope > PRM scopes_supported. Empty if neither was given.
     pub scopes: Vec<String>,
     /// The MCP resource server's own URL. Defaults to the MCP server URL
-    /// passed on the command line. Used as the `base_url` for
-    /// `OAuthState::new`: rmcp's `AuthorizationManager` treats `base_url` as
-    /// the resource server, both for validating Protected Resource Metadata
-    /// (SEP-985) and as the RFC 8707 `resource` parameter it attaches to
-    /// authorize/token/refresh requests.
-    pub resource: String,
+    /// passed on the command line (`--resource` overrides it). Used as the
+    /// `base_url` for `OAuthState::new`: rmcp's `AuthorizationManager`
+    /// treats `base_url` as the resource server, both for validating
+    /// Protected Resource Metadata (SEP-985) and as the RFC 8707 `resource`
+    /// parameter it attaches to authorize/token/refresh requests. Typed as
+    /// a `Url` because rmcp requires a fetchable http(s) URL here — the CLI
+    /// layer enforces the scheme before this struct is ever built.
+    pub resource: url::Url,
 }
 
 /// Protected Resource Metadata, as defined by RFC 9728.
@@ -68,7 +70,7 @@ pub async fn discover(
     http_client: &reqwest::Client,
     server_url: &str,
     headers: &HashMap<HeaderName, HeaderValue>,
-    resource_override: Option<&str>,
+    resource_override: Option<&url::Url>,
 ) -> Result<AuthRequirement> {
     tracing::debug!(server_url, "probing MCP server for auth requirements");
 
@@ -128,9 +130,12 @@ pub async fn discover(
 
     tracing::debug!(?www_auth, "parsed WWW-Authenticate header");
 
-    let resource = resource_override
-        .map(str::to_string)
-        .unwrap_or_else(|| server_url.to_string());
+    let resource = match resource_override {
+        Some(r) => r.clone(),
+        None => url::Url::parse(server_url).context(
+            "server URL is not a valid URL; cannot use it as the OAuth resource identifier",
+        )?,
+    };
 
     // Try to fetch Protected Resource Metadata. Order:
     //   1. URL from WWW-Authenticate `resource_metadata=...`
@@ -611,6 +616,11 @@ mod tests {
             AuthRequirement::Required(d) => {
                 assert_eq!(d.authorization_server, "https://auth.example.com");
                 assert_eq!(d.scopes, vec!["read".to_string(), "write".to_string()]);
+                assert_eq!(
+                    d.resource.as_str(),
+                    format!("{base}/mcp"),
+                    "without --resource, the resource must default to the server URL"
+                );
             }
             AuthRequirement::None => panic!("expected Required, got None"),
         }
@@ -632,12 +642,13 @@ mod tests {
         });
         let (base, _h) = spawn_mock(state).await;
 
+        let override_url = url::Url::parse("https://tenant.example.com/mcp").expect("override URL");
         let client = reqwest::Client::new();
         let out = discover(
             &client,
             &format!("{base}/mcp"),
             &empty_headers(),
-            Some("custom-resource"),
+            Some(&override_url),
         )
         .await
         .expect("discover");
@@ -648,7 +659,7 @@ mod tests {
                     vec!["header-a".to_string(), "header-b".to_string()],
                     "header scope must win over PRM scopes_supported"
                 );
-                assert_eq!(d.resource, "custom-resource");
+                assert_eq!(d.resource, override_url);
             }
             AuthRequirement::None => panic!("expected Required"),
         }

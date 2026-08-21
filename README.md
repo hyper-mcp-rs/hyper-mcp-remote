@@ -222,7 +222,7 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | Flag                              | Description                                                                                                                                          |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--header <HEADER>`               | Extra HTTP header to send on every request. Format `Name: value`. Supports `${ENV}` interpolation. Repeatable.                                       |
-| `--resource <URL>`                | OAuth resource identifier (RFC 8707). Use to isolate sessions when proxying multiple tenants of the same server.                                     |
+| `--resource <URL>`                | OAuth resource identifier (RFC 8707): the MCP server's canonical http(s) URL, sent as the token audience and used as the OAuth discovery base URL in place of `<SERVER_URL>`. Must match the `resource` field in the server's Protected Resource Metadata; no fragment allowed. Distinct values also isolate cached credentials (e.g. tenant-specific resource URLs). |
 | `--client-name <NAME>`            | OAuth client name advertised during dynamic client registration. Default: `hyper-mcp-remote`.                                                        |
 | `--client-id <ID_OR_URL>`         | Pre-registered OAuth client ID; skips dynamic client registration. Accepts the ID itself or an `https://` URL to a Client ID Metadata Document whose `client_id` field is used. Required for IdPs without DCR support (e.g. Microsoft Entra ID) — see *Pre-registered clients* below. |
 | `--scope <SCOPES>`                | Comma-separated OAuth scopes, overriding any scopes discovered from server metadata.                                                                 |
@@ -443,7 +443,7 @@ need to tunnel the redirect.
 **OAuth keeps re-prompting.**
 Run with `--reset-auth` once to clear stale tokens, then try again. If you
 proxy multiple tenants of the same server, give each its own `--resource`
-value so their tokens don't collide.
+URL (e.g. the tenant-specific server URL) so their tokens don't collide.
 
 **The server uses self-signed certificates.**
 Not currently supported — `reqwest` is built with rustls and the system
