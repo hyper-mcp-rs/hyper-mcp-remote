@@ -72,7 +72,7 @@ pub async fn acquire_auth_client(
         &http_client,
         &cli.server_url,
         headers,
-        cli.resource.as_deref(),
+        cli.resource.as_ref(),
     )
     .await
     .context("failed to discover OAuth requirements")?;
@@ -136,11 +136,20 @@ pub async fn acquire_auth_client(
 /// module depends on a different (older) major of `reqwest` than the
 /// streamable-http transport, and mixing the two would require
 /// hand-bridging incompatible client types.
+///
+/// `base_url` must be the *resource* URL (the MCP server itself), not the
+/// authorization server issuer: rmcp's `AuthorizationManager` uses it both
+/// to validate Protected Resource Metadata (SEP-985) against the resource
+/// server it re-fetches PRM from, and as the RFC 8707 `resource` parameter
+/// on authorize/token/refresh requests. Passing the authorization server
+/// URL here makes rmcp's own PRM re-fetch mismatch against the `resource`
+/// field servers correctly advertise (e.g. mcp.cloudflare.com), and sends
+/// the wrong audience in the `resource` parameter.
 async fn new_oauth_state(
     discovery: &OAuthDiscovery,
     store: &Arc<SecureCredentialStore>,
 ) -> Result<OAuthState> {
-    let mut state = OAuthState::new(discovery.authorization_server.as_str(), None)
+    let mut state = OAuthState::new(discovery.resource.as_str(), None)
         .await
         .context("failed to initialize OAuth state machine")?;
     install_credential_store(&mut state, store.clone()).await?;
@@ -349,7 +358,7 @@ async fn run_interactive_flow(
     let code = authorize_in_browser(cli, &auth_url, callback).await?;
 
     state
-        .handle_callback(&code.code, &code.state)
+        .handle_callback_with_issuer(&code.code, &code.state, code.iss.as_deref())
         .await
         .context("OAuth code exchange failed")?;
 
@@ -396,6 +405,11 @@ async fn resolve_client_id(raw: &str, http: &HttpClient) -> Result<String> {
 /// This drops below the `OAuthState` convenience wrapper because its
 /// `start_authorization` path unconditionally registers; rmcp's docs
 /// explicitly support driving `AuthorizationManager` directly.
+///
+/// As with [`new_oauth_state`], the `base_url` handed to rmcp must be the
+/// *resource* URL, not the authorization server: rmcp validates Protected
+/// Resource Metadata against it and attaches it as the RFC 8707 `resource`
+/// parameter on authorize/token/refresh requests.
 async fn prepare_preregistered_manager(
     discovery: &OAuthDiscovery,
     store: &Arc<SecureCredentialStore>,
@@ -403,7 +417,7 @@ async fn prepare_preregistered_manager(
     scopes: &[String],
     redirect_uri: &str,
 ) -> Result<AuthorizationManager> {
-    let mut manager = AuthorizationManager::new(discovery.authorization_server.as_str())
+    let mut manager = AuthorizationManager::new(discovery.resource.as_str())
         .await
         .context("failed to initialize OAuth authorization manager")?;
     manager.set_credential_store(ArcStore(store.clone()));
@@ -456,9 +470,12 @@ async fn run_preregistered_flow(
     let code = authorize_in_browser(cli, &auth_url, callback).await?;
 
     // Persists the token set (with `token_received_at`) through our
-    // credential store, same as the DCR path.
+    // credential store, same as the DCR path. The RFC 9207 `iss` must be
+    // forwarded here too: servers advertising
+    // `authorization_response_iss_parameter_supported` hard-require it
+    // back at token-exchange time.
     manager
-        .exchange_code_for_token(&code.code, &code.state)
+        .exchange_code_for_token_with_issuer(&code.code, &code.state, code.iss.as_deref())
         .await
         .context("OAuth code exchange failed")?;
 
@@ -569,7 +586,7 @@ mod tests {
         OAuthDiscovery {
             authorization_server: "https://auth.example.com".to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
-            resource: "https://example.com/mcp".to_string(),
+            resource: url::Url::parse("https://example.com/mcp").expect("resource URL"),
         }
     }
 
@@ -849,8 +866,133 @@ mod tests {
         OAuthDiscovery {
             authorization_server: auth_server.to_string(),
             scopes: vec![],
-            resource: "https://example.com/mcp".to_string(),
+            // `resource` is now what `new_oauth_state` actually uses as the
+            // `base_url` handed to rmcp (see the fix this test file guards
+            // against a regression of): rmcp re-runs metadata discovery
+            // from it on every `set_credentials`/refresh, so it must point
+            // at our mock server too, or these tests would silently make
+            // real network calls to whatever fake host was here instead.
+            resource: url::Url::parse(auth_server).expect("mock auth server URL must parse"),
         }
+    }
+
+    /// Serves Protected Resource Metadata and RFC 8414/7591 endpoints all on
+    /// one origin, with the resource living at a sub-path (`/mcp`) and the
+    /// authorization server at the origin root — the same shape as
+    /// `mcp.cloudflare.com`. `resource` in the PRM document is deliberately
+    /// the full `{base}/mcp` URL, distinct from `authorization_servers`
+    /// (just `{base}`), so a test driving `OAuthState` with the wrong one as
+    /// `base_url` fails the SEP-985 resource-mismatch check.
+    async fn spawn_cloudflare_shaped_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{addr}");
+
+        let prm = serde_json::json!({
+            "resource": format!("{base}/mcp"),
+            "authorization_servers": [base],
+            "bearer_methods_supported": ["header"],
+        });
+        let as_metadata = serde_json::json!({
+            "issuer": base,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "registration_endpoint": format!("{base}/register"),
+            "authorization_response_iss_parameter_supported": true,
+        });
+
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get({
+                    let prm = prm.clone();
+                    move || {
+                        let prm = prm.clone();
+                        async move { axum::Json(prm) }
+                    }
+                }),
+            )
+            .route(
+                // Real Cloudflare serves the identical PRM document (with
+                // `resource: "{base}/mcp"`) at the bare root well-known path
+                // too, not just the `/mcp`-suffixed one. That's what makes
+                // the old bug bite: even with `base_url` wrongly set to the
+                // authorization-server root, rmcp's PRM re-fetch still finds
+                // a real (mismatching) document here instead of 404ing and
+                // falling back to the legacy RFC 8414 discovery path.
+                "/.well-known/oauth-protected-resource",
+                get(move || {
+                    let prm = prm.clone();
+                    async move { axum::Json(prm) }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let as_metadata = as_metadata.clone();
+                    async move { axum::Json(as_metadata) }
+                }),
+            )
+            .route(
+                "/register",
+                post(|body: String| async move {
+                    let req: serde_json::Value =
+                        serde_json::from_str(&body).expect("valid registration request JSON");
+                    axum::Json(serde_json::json!({
+                        "client_id": "test-client-id",
+                        "redirect_uris": req["redirect_uris"],
+                    }))
+                }),
+            );
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (base, handle)
+    }
+
+    /// Regression test for the resource/base_url bug: `new_oauth_state` must
+    /// hand rmcp the resource URL (`discovery.resource`), not the
+    /// authorization server issuer (`discovery.authorization_server`), as
+    /// `base_url`. With the old code this failed before a browser was ever
+    /// opened, with "Protected resource metadata resource mismatch: expected
+    /// '<authorization_server>', got '<resource>'" — because rmcp's
+    /// `discover_metadata()` re-fetches PRM from `base_url` and requires it
+    /// to equal the `resource` field the server reports.
+    #[tokio::test]
+    async fn start_authorization_succeeds_when_resource_and_authorization_server_share_origin() {
+        let (base, _handle) = spawn_cloudflare_shaped_server().await;
+        let discovery = OAuthDiscovery {
+            authorization_server: base.clone(),
+            scopes: vec![],
+            resource: url::Url::parse(&format!("{base}/mcp")).expect("resource URL must parse"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            SecureCredentialStore::with_data_dir(
+                &CredentialKey::new(discovery.resource.as_str(), None),
+                dir.path(),
+            )
+            .expect("with_data_dir"),
+        );
+
+        let mut state = new_oauth_state(&discovery, &store)
+            .await
+            .expect("OAuthState must initialize");
+        state
+            .start_authorization(
+                &[],
+                "http://127.0.0.1:0/oauth/callback",
+                Some("test-client"),
+            )
+            .await
+            .expect(
+                "start_authorization must succeed: PRM's `resource` field matches \
+                 discovery.resource used as base_url, not discovery.authorization_server",
+            );
     }
 
     fn make_test_store(dir: &std::path::Path, salt: &str) -> Arc<SecureCredentialStore> {
@@ -1111,6 +1253,56 @@ mod tests {
         assert!(
             params.contains_key("code_challenge"),
             "authorize URL must carry a PKCE challenge"
+        );
+    }
+
+    /// Regression test for the pre-registered flow's variant of the
+    /// resource/base_url bug: `prepare_preregistered_manager` was added on
+    /// main (before the base_url fix landed) passing
+    /// `discovery.authorization_server` to `AuthorizationManager::new`, so
+    /// merging the two silently reintroduced the bug in the `--client-id`
+    /// path. Same Cloudflare-shaped mock as the DCR-path test: PRM's
+    /// `resource` is `{base}/mcp`, so rmcp's own PRM re-fetch mismatches
+    /// unless `base_url` is `discovery.resource`. Also asserts the RFC 8707
+    /// `resource` parameter carries the resource URL (the token audience),
+    /// not the AS URL.
+    #[tokio::test]
+    async fn preregistered_manager_succeeds_when_resource_and_authorization_server_share_origin() {
+        let (base, _handle) = spawn_cloudflare_shaped_server().await;
+        let discovery = OAuthDiscovery {
+            authorization_server: base.clone(),
+            scopes: vec![],
+            resource: url::Url::parse(&format!("{base}/mcp")).expect("resource URL must parse"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store(dir.path(), "prereg-cf");
+
+        let manager = prepare_preregistered_manager(
+            &discovery,
+            &store,
+            "pre-registered-id",
+            &["read".to_string()],
+            "http://127.0.0.1:9099/oauth/callback",
+        )
+        .await
+        .expect(
+            "pre-registered manager must initialize: base_url must be discovery.resource, \
+             not discovery.authorization_server, or rmcp's PRM re-fetch mismatches",
+        );
+
+        let url = manager
+            .get_authorization_url(&["read"])
+            .await
+            .expect("authorization URL");
+        let parsed = url::Url::parse(&url).expect("valid URL");
+        let resource_param = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "resource")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(
+            resource_param.as_deref(),
+            Some(format!("{base}/mcp").as_str()),
+            "RFC 8707 resource parameter must be the resource URL, not the AS URL"
         );
     }
 }

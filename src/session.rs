@@ -293,6 +293,22 @@ mod tests {
     }
 
     #[test]
+    fn credential_key_resource_survives_url_roundtrip() {
+        // `--resource` is parsed as `url::Url` before it reaches
+        // CredentialKey, so the hashed bytes are the Url's serialization.
+        // A canonical URL must serialize back to the exact input string,
+        // keeping credentials cached under the raw CLI value (pre-Url
+        // versions) reachable after upgrade.
+        let raw = "https://example.com/mcp/tenant-1";
+        let parsed = url::Url::parse(raw).expect("parse");
+        assert_eq!(parsed.as_str(), raw, "canonical URL must round-trip");
+        assert_eq!(
+            CredentialKey::new("https://example.com/mcp", Some(raw)),
+            CredentialKey::new("https://example.com/mcp", Some(parsed.as_str())),
+        );
+    }
+
+    #[test]
     fn credential_key_differs_on_path() {
         let a = CredentialKey::new("https://example.com/mcp", None);
         let b = CredentialKey::new("https://example.com/other", None);

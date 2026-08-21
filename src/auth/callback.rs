@@ -27,6 +27,11 @@ pub const CALLBACK_PATH: &str = "/oauth/callback";
 pub struct AuthCode {
     pub code: String,
     pub state: String,
+    /// RFC 9207 authorization server issuer identifier, if the server sent
+    /// one. Must be forwarded to rmcp's issuer-checking callback handler —
+    /// servers that advertise `authorization_response_iss_parameter_supported`
+    /// hard-require it back at token-exchange time.
+    pub iss: Option<String>,
 }
 
 /// A running callback server. Drop the handle to shut it down early; call
@@ -59,6 +64,7 @@ struct CallbackQuery {
     state: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+    iss: Option<String>,
 }
 
 struct AppState {
@@ -151,7 +157,11 @@ async fn handle_callback(
             description: q.error_description,
         })
     } else if let (Some(code), Some(state)) = (q.code, q.state) {
-        Ok(AuthCode { code, state })
+        Ok(AuthCode {
+            code,
+            state,
+            iss: q.iss,
+        })
     } else {
         Err(CallbackError::MissingCode)
     };
@@ -244,6 +254,34 @@ mod tests {
         let code = waiter.await.expect("task").expect("wait");
         assert_eq!(code.code, "abc123");
         assert_eq!(code.state, "xyz789");
+        assert_eq!(
+            code.iss, None,
+            "no iss param sent means AuthCode.iss must be None, not an empty string or default"
+        );
+    }
+
+    /// Regression test: `iss` (RFC 9207) must be captured and threaded
+    /// through to `AuthCode`, not silently dropped. Authorization servers
+    /// that advertise `authorization_response_iss_parameter_supported` (e.g.
+    /// Cloudflare's) hard-require this value back at token-exchange time via
+    /// `handle_callback_with_issuer`; losing it here made every such server
+    /// fail authorization with "response missing required issuer".
+    #[tokio::test]
+    async fn callback_with_iss_param_is_captured() {
+        let server = CallbackServer::bind("127.0.0.1", 0).await.expect("bind");
+        let url = format!(
+            "{}?code=abc123&state=xyz789&iss=https%3A%2F%2Fauth.example.com",
+            server.redirect_uri
+        );
+
+        let client = reqwest::Client::new();
+        let waiter = tokio::spawn(server.wait(Duration::from_secs(5)));
+
+        let resp = client.get(&url).send().await.expect("send");
+        assert!(resp.status().is_success());
+
+        let code = waiter.await.expect("task").expect("wait");
+        assert_eq!(code.iss.as_deref(), Some("https://auth.example.com"));
     }
 
     #[tokio::test]
