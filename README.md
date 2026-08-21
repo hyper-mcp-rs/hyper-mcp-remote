@@ -224,6 +224,7 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | `--header <HEADER>`               | Extra HTTP header to send on every request. Format `Name: value`. Supports `${ENV}` interpolation. Repeatable.                                       |
 | `--resource <URL>`                | OAuth resource identifier (RFC 8707). Use to isolate sessions when proxying multiple tenants of the same server.                                     |
 | `--client-name <NAME>`            | OAuth client name advertised during dynamic client registration. Default: `hyper-mcp-remote`.                                                        |
+| `--client-id <ID_OR_URL>`         | Pre-registered OAuth client ID; skips dynamic client registration. Accepts the ID itself or an `https://` URL to a Client ID Metadata Document whose `client_id` field is used. Required for IdPs without DCR support (e.g. Microsoft Entra ID) — see *Pre-registered clients* below. |
 | `--scope <SCOPES>`                | Comma-separated OAuth scopes, overriding any scopes discovered from server metadata.                                                                 |
 | `--callback-host <HOST>`          | Bind address for the local OAuth callback server (loopback only). Default: `127.0.0.1`.                                                              |
 | `--callback-port <PORT>`          | Fixed port for the local OAuth callback server. Defaults to an OS-selected ephemeral port. Set this when the auth server requires a fixed redirect URI. |
@@ -237,6 +238,43 @@ hyper-mcp-remote [OPTIONS] <SERVER_URL>
 | `--deny-tool <PATTERN>`           | Drop tools whose name matches this glob pattern. Applied after `--allow-tool`. Repeatable; values may also be comma-separated.                       |
 | `-h`, `--help`                    | Print help.                                                                                                                                          |
 | `-V`, `--version`                 | Print version.                                                                                                                                       |
+
+### Pre-registered clients (Entra ID and other DCR-less IdPs)
+
+Some identity providers — most notably **Microsoft Entra ID** — do not
+support RFC 7591 dynamic client registration. For those, register the
+application in the IdP yourself and hand the resulting client ID to the
+proxy:
+
+```json
+{
+  "mcpServers": {
+    "entra-protected": {
+      "command": "hyper-mcp-remote",
+      "args": [
+        "https://example.com/mcp",
+        "--client-id", "11111111-2222-3333-4444-555555555555",
+        "--callback-port", "9099"
+      ]
+    }
+  }
+}
+```
+
+The value may also be an `https://` URL pointing at a Client ID Metadata
+Document; the proxy fetches it and uses its `client_id` field.
+
+Two things to know:
+
+* IdPs that require pre-registration almost always require a
+  **pre-registered redirect URI** too. Pin the loopback port with
+  `--callback-port` and register
+  `http://127.0.0.1:<port>/oauth/callback` with the IdP.
+* The rest of the flow is unchanged: RFC 8414 metadata discovery,
+  OAuth 2.1 authorize + PKCE (S256), token exchange, and refresh all
+  work exactly as they do with dynamic registration. If you switch
+  `--client-id` values for a server with cached tokens, run
+  `--reset-auth` once to drop credentials minted for the old client.
 
 ### Passing secrets via headers
 
