@@ -10,6 +10,7 @@ on:
       - ".gitignore"
       - "LICENSE"
       - ".github/renovate.json5"
+      - ".github/ISSUE_TEMPLATE/**"
       - ".dockerignore"
       - "Dockerfile"
       - ".zed/**"

@@ -520,16 +520,16 @@ src/
 
 ## Contributing
 
-Issues and PRs welcome. Before sending a patch:
+Issues and PRs welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full
+guide (toolchain setup, git hooks, testing and coverage requirements, and the
+PR checklist). The short version:
 
 ```sh
+lefthook install   # once after cloning
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
-
-Pre-commit hooks are wired through [`lefthook`](https://github.com/evilmartians/lefthook);
-run `lefthook install` once after cloning.
 
 ## License
 

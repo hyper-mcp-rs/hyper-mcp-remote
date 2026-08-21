@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: >
+        Describe the use case or pain point. If the request relates to a
+        specific MCP server, IdP, or client, please name it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        How would you like it to work? CLI flags, config, behavior — sketches
+        welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Workarounds you've tried, or reasons existing options (e.g.
+        `--header`, `--allow-tool`, `--static-oauth-client-info`) don't fit.
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to open a PR for this (see CONTRIBUTING.md).

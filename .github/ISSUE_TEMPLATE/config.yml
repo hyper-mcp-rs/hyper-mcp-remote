@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/hyper-mcp-rs/hyper-mcp-remote#troubleshooting
+    about: Common connection, OAuth, and logging issues are covered in the README.

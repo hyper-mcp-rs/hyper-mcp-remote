@@ -1,0 +1,74 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please check the
+        [Troubleshooting](https://github.com/hyper-mcp-rs/hyper-mcp-remote#troubleshooting)
+        section of the README first — several common issues are covered there.
+
+  - type: input
+    id: version
+    attributes:
+      label: hyper-mcp-remote version
+      description: Output of `hyper-mcp-remote --version`
+      placeholder: "0.5.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.3 (arm64), Ubuntu 24.04, Windows 11, ..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      description: The client that launches hyper-mcp-remote
+      options:
+        - Claude Desktop
+        - Zed
+        - Cursor
+        - Windsurf
+        - Other (specify in the description below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: >
+        What did you do, what did you expect, and what happened instead?
+        Include the relevant client configuration (command + args) if the
+        problem involves connecting to a server.
+      placeholder: |
+        1. Configured the server as ...
+        2. Started the client ...
+        3. Expected ..., but instead ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        See the "Where things live" section of the README for log file
+        locations. **Scrub tokens, secrets, and any private URLs before
+        posting.**
+      render: text
+
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed tokens, secrets, and other sensitive data from the report above.
+          required: true
