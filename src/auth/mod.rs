@@ -846,7 +846,11 @@ mod tests {
             .await
             .expect("OAuthState must initialize");
         state
-            .start_authorization(&[], "http://127.0.0.1:0/oauth/callback", Some("test-client"))
+            .start_authorization(
+                &[],
+                "http://127.0.0.1:0/oauth/callback",
+                Some("test-client"),
+            )
             .await
             .expect(
                 "start_authorization must succeed: PRM's `resource` field matches \
