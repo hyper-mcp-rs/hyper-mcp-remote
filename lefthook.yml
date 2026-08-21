@@ -60,6 +60,16 @@ pre-push:
   commands:
     test-coverage:
       tags: rust test coverage
+      # Only run when the push range touches files that affect compilation
+      # or test results: Rust sources, dependency manifests, the pinned
+      # toolchain, or cargo config. Docs-only pushes (README, CONTRIBUTING,
+      # GitHub templates, CI config, ...) skip the suite entirely.
+      glob:
+        - "*.rs"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - "rust-toolchain.toml"
+        - ".cargo/**"
       # `cargo llvm-cov` runs the full test suite with LLVM source-based
       # coverage instrumentation and exits non-zero if total line
       # coverage drops below 70%. Two failure modes in one command:
