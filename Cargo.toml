@@ -19,7 +19,7 @@ axum = "0.8"
 clap = { version = "4.6", features = ["derive", "env"] }
 ctor = "1.0"
 directories = "6.0"
-dirs = "6.0"
+dirs = "7.0"
 futures = "0.3"
 # Glob matching for tool name allow/deny lists. Backed by `regex-automata`,
 # which is already in the dep tree via `tracing-subscriber`, so this adds no
@@ -46,7 +46,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "stream",
 ] }
-rmcp = { version = "2.2", features = [
+rmcp = { version = "3.0", features = [
     "server",
     "client",
     "transport-io",
@@ -63,7 +63,7 @@ rmcp = { version = "2.2", features = [
 #   - compression-zip-deflate handles the .zip asset (Windows); it pulls in archive-zip
 # With "signatures", enabling archive-tar/archive-zip also turns on zipsign's
 # verify-tar/verify-zip, so downloaded archives are signature-verified.
-self_update = { version = "0.44", features = [
+self_update = { version = "1.0", features = [
     "signatures",
     "rustls",
     "compression-flate2",
@@ -90,7 +90,7 @@ axum = "0.8"
 # Pulls in `transport-child-process` so the integration test can drive the
 # compiled `hyper-mcp-remote` binary over its stdin/stdout. The feature is
 # additive: Cargo merges the dev-deps feature set with the bin's.
-rmcp = { version = "2.2", features = ["transport-child-process"] }
+rmcp = { version = "3.0", features = ["transport-child-process"] }
 
 [[bin]]
 name = "hyper-mcp-remote"
