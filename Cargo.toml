@@ -38,7 +38,7 @@ oauth2 = { version = "5.0", default-features = false }
 # per-backend feature flags (apple-native/windows-native/sync-secret-service)
 # and `vendored` (the Secret Service store now uses `crypto-rust`, so no
 # vendored OpenSSL is required).
-keyring = { version = "4.1", features = ["v1"] }
+keyring = { version = "4.2", features = ["v1"] }
 # Must match rmcp 1.7's transport-streamable-http-client-reqwest reqwest version.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
