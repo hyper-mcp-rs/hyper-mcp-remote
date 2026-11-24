@@ -8,11 +8,20 @@
 //! The on-disk encoding is the JSON representation of rmcp's
 //! [`StoredCredentials`], which is the same type the in-memory store uses,
 //! so the round-trip is lossless.
+//!
+//! One deviation from a dumb byte store: [`CredentialStore::save`] refuses
+//! to move `token_received_at` *later* for an access token that is already
+//! persisted. rmcp's `OAuthState::set_credentials` re-saves whatever it is
+//! handed with a fresh timestamp, so every launch that restored cached
+//! credentials used to push the recorded expiry out by a full lifetime. Once
+//! that lie was on disk, the proactive refresh never fired, the expired token
+//! was sent as-is, and the server's 401 surfaced as a fatal "Auth required".
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use oauth2::TokenResponse;
 use rmcp::transport::auth::{AuthError, CredentialStore, StoredCredentials};
 
 use crate::session::CredentialKey;
@@ -124,6 +133,59 @@ impl SecureCredentialStore {
         }
     }
 
+    /// Parse whatever `read_raw` finds. `Ok(None)` when nothing is stored.
+    fn load_sync(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        let Some(raw) = self.read_raw()? else {
+            return Ok(None);
+        };
+        let creds: StoredCredentials = serde_json::from_str(&raw).map_err(|e| {
+            AuthError::InternalError(format!("failed to deserialize stored credentials: {e}"))
+        })?;
+        Ok(Some(creds))
+    }
+
+    /// Keep the earlier `token_received_at` when `incoming` carries the
+    /// same access token that is already stored.
+    ///
+    /// A token cannot have been received later than it was first seen, so
+    /// a newer timestamp for an unchanged token is always a re-save of
+    /// restored credentials (rmcp's `set_credentials` does exactly that),
+    /// never new information. Taking the minimum keeps the expiry
+    /// bookkeeping honest no matter how many processes restore the same
+    /// cache concurrently. A *different* access token is a genuine
+    /// exchange or refresh and is stored with the timestamp it came with.
+    ///
+    /// Read failures are swallowed: a corrupt or unreadable existing entry
+    /// must not stop a fresh token from being written over it.
+    fn preserve_received_at(&self, mut incoming: StoredCredentials) -> StoredCredentials {
+        let existing = match self.load_sync() {
+            Ok(Some(existing)) => existing,
+            Ok(None) => return incoming,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read existing credentials; saving as-is");
+                return incoming;
+            }
+        };
+        let same_token = match (&existing.token_response, &incoming.token_response) {
+            (Some(old), Some(new)) => old.access_token().secret() == new.access_token().secret(),
+            _ => false,
+        };
+        if same_token && let Some(old_at) = existing.token_received_at {
+            let kept = incoming
+                .token_received_at
+                .map_or(old_at, |new_at| new_at.min(old_at));
+            if Some(kept) != incoming.token_received_at {
+                tracing::debug!(
+                    genuine = kept,
+                    requested = ?incoming.token_received_at,
+                    "re-save of an unchanged access token; keeping its original token_received_at"
+                );
+            }
+            incoming.token_received_at = Some(kept);
+        }
+        incoming
+    }
+
     /// Persist `data` to the keyring; on failure, fall back to a 0600 file.
     fn write_raw(&self, data: &str) -> Result<(), AuthError> {
         match keyring::Entry::new(KEYRING_SERVICE, &self.account) {
@@ -151,17 +213,11 @@ impl SecureCredentialStore {
 #[async_trait]
 impl CredentialStore for SecureCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        let raw = match self.read_raw()? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        let creds: StoredCredentials = serde_json::from_str(&raw).map_err(|e| {
-            AuthError::InternalError(format!("failed to deserialize stored credentials: {e}"))
-        })?;
-        Ok(Some(creds))
+        self.load_sync()
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        let credentials = self.preserve_received_at(credentials);
         let raw = serde_json::to_string(&credentials).map_err(|e| {
             AuthError::InternalError(format!("failed to serialize credentials: {e}"))
         })?;
@@ -273,6 +329,141 @@ mod tests {
             loaded.token_response.is_some(),
             "token_response must round-trip"
         );
+    }
+
+    /// `sample_credentials()` with a different access token and timestamp.
+    fn credentials_with(access_token: &str, token_received_at: Option<u64>) -> StoredCredentials {
+        let json = serde_json::json!({
+            "client_id": "client-abc",
+            "token_response": {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "expires_in": 3600,
+                "refresh_token": "refresh-token-zzz",
+            },
+            "granted_scopes": [],
+            "token_received_at": token_received_at,
+        });
+        serde_json::from_value(json).expect("credentials must deserialize")
+    }
+
+    #[tokio::test]
+    async fn save_keeps_earlier_received_at_when_access_token_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path(), "same-token-later-stamp");
+        clear_keyring(&store);
+
+        store
+            .save(credentials_with("same-token", Some(1_700_000_000)))
+            .await
+            .expect("first save");
+        // What rmcp's set_credentials does on every restore: same token,
+        // timestamp replaced by "now".
+        store
+            .save(credentials_with("same-token", Some(1_700_006_000)))
+            .await
+            .expect("re-save");
+
+        let loaded = store.load().await.expect("load").expect("present");
+        assert_eq!(
+            loaded.token_received_at,
+            Some(1_700_000_000),
+            "a re-save of the same token must not make it look younger"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_accepts_earlier_received_at_when_access_token_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path(), "same-token-earlier-stamp");
+        clear_keyring(&store);
+
+        store
+            .save(credentials_with("same-token", Some(1_700_006_000)))
+            .await
+            .expect("first save");
+        store
+            .save(credentials_with("same-token", Some(1_700_000_000)))
+            .await
+            .expect("re-save with the genuine, earlier stamp");
+
+        let loaded = store.load().await.expect("load").expect("present");
+        assert_eq!(
+            loaded.token_received_at,
+            Some(1_700_000_000),
+            "the earlier of the two timestamps must win"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_keeps_existing_received_at_when_incoming_has_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path(), "same-token-no-stamp");
+        clear_keyring(&store);
+
+        store
+            .save(credentials_with("same-token", Some(1_700_000_000)))
+            .await
+            .expect("first save");
+        store
+            .save(credentials_with("same-token", None))
+            .await
+            .expect("re-save without a timestamp");
+
+        let loaded = store.load().await.expect("load").expect("present");
+        assert_eq!(
+            loaded.token_received_at,
+            Some(1_700_000_000),
+            "losing the timestamp would disable proactive refresh for this token"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_takes_new_received_at_when_access_token_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path(), "new-token");
+        clear_keyring(&store);
+
+        store
+            .save(credentials_with("old-token", Some(1_700_000_000)))
+            .await
+            .expect("first save");
+        store
+            .save(credentials_with("new-token", Some(1_700_006_000)))
+            .await
+            .expect("save after refresh");
+
+        let loaded = store.load().await.expect("load").expect("present");
+        assert_eq!(
+            loaded.token_received_at,
+            Some(1_700_006_000),
+            "a refreshed token is genuinely new and keeps its own timestamp"
+        );
+        assert_eq!(
+            loaded
+                .token_response
+                .as_ref()
+                .map(|t| t.access_token().secret().as_str()),
+            Some("new-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_ignores_unreadable_existing_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = make_store(dir.path(), "corrupt-then-save");
+        clear_keyring(&store);
+
+        std::fs::create_dir_all(store.fallback_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&store.fallback_path, "not-json").expect("write garbage");
+
+        store
+            .save(credentials_with("fresh-token", Some(1_700_006_000)))
+            .await
+            .expect("a corrupt existing entry must not block saving");
+
+        let loaded = store.load().await.expect("load").expect("present");
+        assert_eq!(loaded.token_received_at, Some(1_700_006_000));
     }
 
     #[tokio::test]

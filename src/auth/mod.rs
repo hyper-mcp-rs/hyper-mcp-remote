@@ -8,6 +8,7 @@
 
 pub mod callback;
 pub mod discovery;
+mod jwt;
 pub mod storage;
 
 use std::collections::HashMap;
@@ -185,14 +186,13 @@ async fn try_cached_credentials(
     let mut state = new_oauth_state(discovery, store).await?;
 
     // Detect staleness BEFORE handing the token to rmcp.
-    // `OAuthState::set_credentials` unconditionally overwrites
-    // `token_received_at` with the current time when it persists the
-    // restored credentials (see `set_credentials` in rmcp 2.2's
-    // transport/auth.rs), so
-    // by the time we'd ask `get_access_token` it would compute
-    // `elapsed = 0` and treat an actually-expired token as fresh.
-    // We have to make the expiry call ourselves, using the genuine
-    // `token_received_at` we just loaded.
+    // `OAuthState::set_credentials` re-persists the restored credentials
+    // with `token_received_at = now` (see `set_credentials` in rmcp 2.2's
+    // transport/auth.rs). Our `SecureCredentialStore::save` keeps the
+    // genuine timestamp on disk for an unchanged token, but rmcp's
+    // in-memory view of the expiry still starts from "now", so if we let
+    // `get_access_token` make the call it would treat an actually-expired
+    // token as fresh. We make the call ourselves, from what we just loaded.
     let stale = cached_access_token_is_stale(&cached);
     tracing::info!(
         stale_cached_token = stale,
@@ -204,23 +204,7 @@ async fn try_cached_credentials(
         .await
         .context("failed to apply cached credentials")?;
 
-    // `set_credentials` just clobbered `token_received_at` on disk
-    // with the current time. That would lie to every future launch
-    // (this one observed the lie when investigating the GitLab cache
-    // failure: the genuine timestamp was overwritten on a previous
-    // run, making an expired access token look fresh forever). Write
-    // the original `StoredCredentials` back so the next launch sees
-    // the truth.
-    if let Err(e) = store.as_ref().save_via_trait(cached.clone()).await {
-        tracing::warn!(
-            error = %e,
-            "could not restore genuine token_received_at after set_credentials; \
-             future launches may incorrectly treat an expired token as fresh"
-        );
-    }
-
     if stale {
-        // We're now in `Authorized` with the wrong `received_at`.
         // Force a refresh so the cache (and the in-memory token rmcp
         // will hand to the transport) reflect a genuinely-fresh
         // access token. If the refresh fails because the refresh
@@ -258,6 +242,9 @@ trait CredentialStoreExt {
         &self,
     ) -> Result<Option<rmcp::transport::auth::StoredCredentials>, rmcp::transport::auth::AuthError>;
 
+    /// Production code only ever writes through rmcp (`set_credentials`,
+    /// `refresh_token`, the interactive flow); tests seed the cache directly.
+    #[cfg(test)]
     async fn save_via_trait(
         &self,
         creds: rmcp::transport::auth::StoredCredentials,
@@ -273,6 +260,7 @@ impl CredentialStoreExt for SecureCredentialStore {
         <Self as rmcp::transport::auth::CredentialStore>::load(self).await
     }
 
+    #[cfg(test)]
     async fn save_via_trait(
         &self,
         creds: rmcp::transport::auth::StoredCredentials,
@@ -534,29 +522,45 @@ fn into_auth_client(state: OAuthState, http_client: HttpClient) -> Result<AuthCl
 const REFRESH_BUFFER_SECS: u64 = 30;
 
 /// True if the cached access token has expired, or is within
-/// [`REFRESH_BUFFER_SECS`] of expiring, according to the genuine
-/// `token_received_at` from our credential store. Returns `false` when
-/// the cache lacks the information needed to make the call (no
-/// `token_received_at`, no `expires_in`, missing `token_response`) so we
-/// don't refresh-storm caches that pre-date timestamping.
+/// [`REFRESH_BUFFER_SECS`] of expiring.
+///
+/// Two independent votes, either of which is enough:
+///
+/// 1. `token_received_at + expires_in`, the bookkeeping our credential
+///    store keeps. Skipped when the cache lacks either value (entries
+///    that pre-date timestamping, servers that omit `expires_in`) so we
+///    don't refresh-storm on every launch.
+/// 2. The token's own `exp` claim, when the access token happens to be a
+///    JWT. This is the issuer's statement and survives anything that
+///    goes wrong with our timestamps (a clobbered `token_received_at`
+///    once made an expired token look fresh for a whole extra lifetime;
+///    the 401 that followed was fatal because no refresh was attempted).
+///
+/// Refreshing early is always safe, so a false positive from either vote
+/// costs one token-endpoint round trip; a false negative costs the
+/// session.
 fn cached_access_token_is_stale(cached: &rmcp::transport::auth::StoredCredentials) -> bool {
     use oauth2::TokenResponse;
 
-    let Some(received_at) = cached.token_received_at else {
-        return false;
-    };
     let Some(token) = cached.token_response.as_ref() else {
-        return false;
-    };
-    let Some(expires_in) = token.expires_in() else {
         return false;
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let elapsed = now.saturating_sub(received_at);
-    expires_in.as_secs().saturating_sub(elapsed) < REFRESH_BUFFER_SECS
+
+    let by_bookkeeping = match (cached.token_received_at, token.expires_in()) {
+        (Some(received_at), Some(expires_in)) => {
+            let elapsed = now.saturating_sub(received_at);
+            expires_in.as_secs().saturating_sub(elapsed) < REFRESH_BUFFER_SECS
+        }
+        _ => false,
+    };
+    let by_exp_claim = jwt::exp_claim(token.access_token().secret())
+        .is_some_and(|exp| exp.saturating_sub(now) < REFRESH_BUFFER_SECS);
+
+    by_bookkeeping || by_exp_claim
 }
 
 fn build_http_client() -> Result<HttpClient> {
@@ -641,11 +645,19 @@ mod tests {
         token_received_at: Option<u64>,
         expires_in_secs: Option<u64>,
     ) -> rmcp::transport::auth::StoredCredentials {
+        sample_stored_with_token("cached-access", token_received_at, expires_in_secs)
+    }
+
+    fn sample_stored_with_token(
+        access_token: &str,
+        token_received_at: Option<u64>,
+        expires_in_secs: Option<u64>,
+    ) -> rmcp::transport::auth::StoredCredentials {
         // Build a StoredCredentials via JSON to avoid pulling in oauth2's
         // builder API just to construct one; this mirrors what rmcp itself
         // writes to disk.
         let mut token = serde_json::json!({
-            "access_token": "cached-access",
+            "access_token": access_token,
             "token_type": "bearer",
             "refresh_token": "cached-refresh",
         });
@@ -717,6 +729,83 @@ mod tests {
         // truth and a reactive 401 will surface as a transport error.
         let stored = sample_stored(Some(now_epoch_secs() - 86_400), None);
         assert!(!cached_access_token_is_stale(&stored));
+    }
+
+    /// An unsigned JWT-shaped token whose payload is `{"exp": <exp>}`.
+    fn jwt_expiring_at(exp: u64) -> String {
+        fn b64url(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let mut n: u32 = 0;
+                for (i, b) in chunk.iter().enumerate() {
+                    n |= u32::from(*b) << (16 - 8 * i);
+                }
+                for i in 0..chunk.len() + 1 {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+                }
+            }
+            out
+        }
+        let payload = format!(r#"{{"exp":{exp}}}"#);
+        format!("{}.{}.sig", b64url(b"{}"), b64url(payload.as_bytes()))
+    }
+
+    #[test]
+    fn stale_when_jwt_exp_is_past_even_if_bookkeeping_says_fresh() {
+        // The incident shape: `token_received_at` was clobbered to "now"
+        // on a re-save, so by our bookkeeping the token has a full
+        // lifetime left, but the token itself expired ten minutes ago.
+        let stored = sample_stored_with_token(
+            &jwt_expiring_at(now_epoch_secs() - 600),
+            Some(now_epoch_secs()),
+            Some(5120),
+        );
+        assert!(
+            cached_access_token_is_stale(&stored),
+            "the token's own exp must override a misleading token_received_at"
+        );
+    }
+
+    #[test]
+    fn stale_when_jwt_exp_is_within_refresh_buffer() {
+        let stored = sample_stored_with_token(
+            &jwt_expiring_at(now_epoch_secs() + REFRESH_BUFFER_SECS - 1),
+            Some(now_epoch_secs()),
+            Some(3600),
+        );
+        assert!(cached_access_token_is_stale(&stored));
+    }
+
+    #[test]
+    fn stale_when_jwt_exp_is_past_and_bookkeeping_is_missing() {
+        // No token_received_at and no expires_in: the bookkeeping vote
+        // abstains, but the token still says it is dead.
+        let stored = sample_stored_with_token(&jwt_expiring_at(now_epoch_secs() - 1), None, None);
+        assert!(cached_access_token_is_stale(&stored));
+    }
+
+    #[test]
+    fn fresh_when_jwt_exp_is_far_and_bookkeeping_agrees() {
+        let stored = sample_stored_with_token(
+            &jwt_expiring_at(now_epoch_secs() + 3600),
+            Some(now_epoch_secs() - 60),
+            Some(3600),
+        );
+        assert!(!cached_access_token_is_stale(&stored));
+    }
+
+    #[test]
+    fn stale_when_bookkeeping_says_expired_even_if_jwt_exp_is_far() {
+        // Either vote suffices; a disagreement means one side is wrong
+        // and refreshing is the cheap way to find out.
+        let stored = sample_stored_with_token(
+            &jwt_expiring_at(now_epoch_secs() + 3600),
+            Some(now_epoch_secs() - 7200),
+            Some(3600),
+        );
+        assert!(cached_access_token_is_stale(&stored));
     }
 
     // --------------------------------------------------------------------
